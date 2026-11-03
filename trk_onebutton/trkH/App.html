@@ -1396,20 +1396,57 @@
       box.innerHTML = upd + '<p class="muted">ดึงล่าสุด ' + escH(String(r.pulledAt).replace('T', ' ').slice(0, 16)) + ' น. · บช. อัปเดต ' + escH(r.snap.updated || '-') + '</p><dl>' + rows + '</dl>' + (ph ? '<div class="ph">' + ph + '</div>' : '') + (hs ? '<details><summary>ประวัติการดึงที่ข้อมูลเปลี่ยน</summary><ul>' + hs + '</ul></details>' : '');
     }).catch(function (e) { if (currentCaseId === id) box.textContent = 'โหลดข้อมูล บช. ไม่สำเร็จ: ' + (e && e.message); });
   }
+  var OUT_MONTHS = ['', 'ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.', 'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.'];
+  function outputLabel(file) {
+    var name = String((file && file.filename) || '');
+    if (name.indexOf('ความคืบหน้า') >= 0) return 'PDF ความคืบหน้า';
+    if (name.indexOf('รวมทุกครั้ง') >= 0) return 'PDF รวม';
+    var dated = name.match(/(?:ครั้งที่\d+_)?(\d{4})-(\d{2})-(\d{2})/);
+    if (dated) {
+      var year = parseInt(dated[1], 10);
+      var month = parseInt(dated[2], 10);
+      var day = parseInt(dated[3], 10);
+      var be = year < 2400 ? year + 543 : year;
+      return 'บันทึกสืบ ' + day + ' ' + (OUT_MONTHS[month] || dated[2]) + ' ' + String(be).slice(-2);
+    }
+    if (name.indexOf('บันทึกสืบ') >= 0) return 'บันทึกสืบ';
+    if (/pdf/i.test(name) || /pdf/i.test(String((file && file.mime) || ''))) return 'PDF';
+    return 'ไฟล์';
+  }
+  function outputIcon(kind) {
+    var ns = 'http://www.w3.org/2000/svg';
+    var svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('width', '14');
+    svg.setAttribute('height', '14');
+    svg.setAttribute('aria-hidden', 'true');
+    var path = document.createElementNS(ns, 'path');
+    path.setAttribute('fill', 'currentColor');
+    path.setAttribute('d', kind === 'dl'
+      ? 'M8 1.2v7.1l2.2-2.2.9.9L8 10.3 4.9 7l.9-.9L8 8.3V1.2zM3 12.4h10V14H3z'
+      : 'M1.6 8S4 4.2 8 4.2 14.4 8 14.4 8 12 11.8 8 11.8 1.6 8 1.6 8zm6.4 2a2 2 0 1 0 0-4 2 2 0 0 0 0 4z');
+    svg.appendChild(path);
+    return svg;
+  }
   function renderCaseOutputs(files) {
     var box = $('case-outputs');
     if (!box) return;
     clear(box);
     if (!files || !files.length) {
-      box.appendChild(el('p', { class: 'muted small', text: 'ยังไม่มีไฟล์ที่บันทึกไว้' }));
+      box.appendChild(el('p', { class: 'out-empty', text: 'ยังไม่มีไฟล์ที่บันทึกไว้' }));
       return;
     }
     files.forEach(function (f) {
-      var row = el('div', { class: 'dl-row' });
-      var name = f.filename || 'ไฟล์';
-      row.appendChild(el('a', { href: f.downloadUrl || f.url, target: '_blank', rel: 'noopener', text: 'ดาวน์โหลด ' + name }));
-      row.appendChild(document.createTextNode(' · '));
-      row.appendChild(el('a', { href: f.url, target: '_blank', rel: 'noopener', text: 'เปิดใน Drive' }));
+      var full = f.filename || 'ไฟล์';
+      var label = outputLabel(f);
+      var row = el('div', { class: 'out-row' });
+      row.appendChild(el('span', { class: 'out-label', title: full, text: label }));
+      var view = el('a', { class: 'out-ico', href: f.url, target: '_blank', rel: 'noopener', title: 'เปิดใน Drive', 'aria-label': 'เปิด ' + label + ' ใน Drive' });
+      view.appendChild(outputIcon('view'));
+      var down = el('a', { class: 'out-ico', href: f.downloadUrl || f.url, target: '_blank', rel: 'noopener', title: 'ดาวน์โหลด', 'aria-label': 'ดาวน์โหลด ' + label });
+      down.appendChild(outputIcon('dl'));
+      row.appendChild(view);
+      row.appendChild(down);
       box.appendChild(row);
     });
   }
