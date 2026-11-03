@@ -1652,15 +1652,17 @@ var Api = (function () {
     var caseRow = findCase(String(caseId || ''));
     var bchId = bchMapFor_(caseRow);
     if (!bchId) throw new Error('เคสนี้ยังไม่ได้ผูก bchCaseId จึงไม่ดึงข้อมูล');
-    var cur = bchReadUpdate_();
-    if (cur && !cur.doneAt && Date.now() - cur.ms < 5 * 60 * 1000) {
-      if (cur.caseId === caseRow.id) return { reqId: cur.id, joined: true, bchCaseId: bchId };
-      throw new Error('มีคำขอดึงข้อมูลเคสอื่นค้างอยู่ กรุณารอให้เสร็จก่อน');
-    }
-    var index = bchKnownIndex_().filter(function (row) { return row.caseId === caseRow.id; });
-    var req = { id: newId('bup'), ms: Date.now(), at: nowIso(), by: user.name, caseId: caseRow.id, bchCaseId: bchId, index: index };
-    bchWriteUpdate_(req);
-    return { reqId: req.id, bchCaseId: bchId };
+    return withLock(function () {
+      var cur = bchReadUpdate_();
+      if (cur && !cur.doneAt && Date.now() - cur.ms < 5 * 60 * 1000) {
+        if (cur.caseId === caseRow.id) return { reqId: cur.id, joined: true, bchCaseId: bchId };
+        throw new Error('มีคำขอดึงข้อมูลเคสอื่นค้างอยู่ กรุณารอให้เสร็จก่อน');
+      }
+      var index = bchKnownIndex_().filter(function (row) { return row.caseId === caseRow.id; });
+      var req = { id: newId('bup'), ms: Date.now(), at: nowIso(), by: user.name, caseId: caseRow.id, bchCaseId: bchId, index: index };
+      bchWriteUpdate_(req);
+      return { reqId: req.id, bchCaseId: bchId };
+    });
   }
   function bchUpdateStatus(token, reqId) {
     requireUser(token);
