@@ -1,0 +1,124 @@
+<script>
+// โปสเตอร์แบบ 1 (นีออน) — สร้างเป็น HTML แล้วแปลงเป็น PNG ในเบราว์เซอร์ด้วย html2canvas (ไม่ใช้ AI/โทเคน)
+var Poster = (function () {
+  var TH = ['', 'ระยะที่ 1', 'ระยะที่ 2', 'ระยะที่ 3', 'ระยะที่ 4', 'ระยะที่ 5'];
+  function E(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+  function short(t, n) { t = String(t || '').replace(/\s+/g, ' ').trim(); if (t.length <= n) return t; var c = t.lastIndexOf(' ', n); return t.slice(0, c > 60 ? c : n) + ' …'; }
+  var CSS = "#pst *{box-sizing:border-box;margin:0}#pst{box-sizing:border-box;position:relative;width:1080px;font-family:'Bai Jamjuree',sans-serif;color:#e8eef8;padding:34px;background-color:#07080f;background-image:radial-gradient(circle at 80% 0,#2a0a3a,rgba(7,8,15,0) 50%)}" +
+    "#pst .hd{display:flex;gap:28px;align-items:center}#pst .logo{width:150px;height:150px;background-size:contain;background-repeat:no-repeat;background-position:center;flex:none}" +
+    "#pst .t1{font:700 52px/1.4 'Chakra Petch';color:#ff3fd1;text-shadow:0 0 14px #ff3fd1}#pst .t2{font:700 38px/1.4 'Chakra Petch';color:#39ff7a;text-shadow:0 0 12px #39ff7a}#pst .t3{font-size:25px;line-height:1.4;margin-top:6px}#pst .t4{font-size:23px;line-height:1.4;opacity:.85}" +
+    "#pst p{font-size:21px;line-height:1.45}#pst .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}#pst .chip{white-space:nowrap;font-size:18px;line-height:1.45;padding:3px 10px;border-radius:4px;border:1px solid #23e4ff;color:#9ff3ff}" +
+    "#pst .st{margin-top:22px;padding:16px 20px;border:2px solid #23e4ff;border-radius:14px;box-shadow:0 0 18px rgba(35,228,255,.4),inset 0 0 22px rgba(35,228,255,.13);position:relative}#pst .s1{border-color:#ff3fd1;box-shadow:0 0 18px rgba(255,63,209,.4)}" +
+    "#pst .bar{position:absolute;top:-2px;left:30px;width:160px;height:6px;background:#39ff7a;box-shadow:0 0 10px #39ff7a}" +
+    "#pst .sh{color:#ffe14a;font:700 32px/1.4 'Chakra Petch'}#pst .lb{font:700 27px/1.4 'Chakra Petch';color:#39ff7a}" +
+    "#pst .sb{display:flex;gap:20px;margin-top:12px}#pst .s1 .sb{flex-direction:row-reverse}#pst .tx{flex:1.15}#pst .pics{flex:1;display:flex;gap:10px;flex-wrap:wrap}" +
+    "#pst .fr{width:calc(50% - 5px);height:150px;border:3px solid #ff3fd1;box-shadow:0 0 12px #ff3fd1;border-radius:8px;overflow:hidden;background:#000}#pst .fr img{display:block;width:100%;height:100%}#pst .ph img{display:block;width:100%;height:auto}" +
+    "#pst .tgs{display:flex;gap:14px;margin-top:12px}#pst .tg{flex:1;text-align:center;min-width:0}#pst .ph{position:relative;background:#fff;border:3px solid #23e4ff;box-shadow:0 0 10px #23e4ff;border-radius:6px;overflow:hidden}" +
+    "#pst .band{position:absolute;left:0;right:0;bottom:0;background:#d71920;color:#fff;font:700 20px/1.45 'Chakra Petch';padding:4px 0}" +
+    "#pst .nm{font-size:16px;line-height:1.4;margin-top:6px;font-weight:600}#pst .trk{font-size:16px;line-height:1.4;margin-top:3px;padding:2px;border-radius:3px;background:#5b2bb5}" +
+    "#pst .nx{font-size:19px;line-height:1.45;padding:10px 16px;margin-top:18px;border:2px solid #39ff7a;border-radius:10px;box-shadow:0 0 14px rgba(57,255,122,.33)}#pst .nx b{color:#39ff7a}" +
+    "#pst .ft{font-size:14px;line-height:1.4;opacity:.6;margin-top:8px;text-align:right}";
+  function bg(u) { return u ? ' style="background-image:url(\'' + u + '\')"' : ''; }
+  function html(d) {
+    var tg = (d.targets || []).map(function (t) {
+      var img = t.photo ? '<div class="ph"><img src="' + t.photo + '">' + (t.arrested ? '<div class="band">จับกุมแล้ว</div>' : '') + '</div>' : '';
+      return '<div class="tg">' + img + '<div class="nm">' + E(t.name) + '</div>' + (t.arrested ? '' : '<div class="trk">' + E(t.outcomeLabel) + '</div>') + '</div>';
+    }).join('');
+    var n = d.stages.length;
+    var st = d.stages.map(function (s, i) {
+      var t = s.texts.length > 1 && s.n === 1 ? s.texts[s.texts.length - 1] : s.texts[0];
+      var ch = (s.plates || []).map(function (p) { return '<span class="chip">ทะเบียน ' + E(p) + '</span>'; }).join('') +
+        (s.phones || []).slice(0, 2).map(function (p) { return '<span class="chip">โทร ' + E(p) + '</span>'; }).join('');
+      var pics = (s.photos || []).slice(0, 2).map(function (u) { return '<div class="fr"><img src="' + u + '"></div>'; }).join('');
+      return '<section class="st s' + (i % 3) + '"><div class="bar"></div><div class="sh">' + E(TH[s.n] || ('ระยะที่ ' + s.n)) + ' [' + E(s.date) + ']</div><div class="lb">' + E(s.label) + '</div>' +
+        '<div class="sb"><div class="tx">' + (t ? '<p>' + E(short(t, n > 3 ? 95 : 125)) + '</p>' : '') + (ch ? '<div class="chips">' + ch + '</div>' : '') + '</div><div class="pics">' + pics + '</div></div>' +
+        (i === n - 1 && tg ? '<div class="tgs">' + tg + '</div>' : '') + '</section>';
+    }).join('');
+    if (!n && tg) st = '<section class="st s0"><div class="bar"></div><div class="tgs">' + tg + '</div></section>';
+    var ft = [d.daysLabel, d.nowText ? 'ข้อมูล ณ ' + d.nowText : '', 'เอกสารสำหรับใช้ภายในหน่วย'].filter(Boolean).map(E).join(' · ');
+    return '<style>' + CSS + '</style><div class="hd"><div class="logo"' + bg(d.logo) + '></div><div><div class="t1">สารตั้งต้น</div><div class="t2">การสืบสวนติดตามเครือข่ายยาเสพติด</div>' +
+      '<div class="t3">ชุดปฏิบัติการข่าว ' + E(d.unitName) + ' (' + E(d.unitShort) + ')</div><div class="t4">' + E(d.caseName) + '</div></div></div>' + st +
+      (d.nextStep ? '<div class="nx"><b>ขั้นต่อไป</b> ' + E(short(d.nextStep, 110)) + '</div>' : '') + '<div class="ft">' + ft + '</div>';
+  }
+  function fit(u, W, H, rc) { // ตัดภาพให้พอดีกรอบ (แทน object-fit) และตัดใบหน้าจากแบบฟอร์มถ้ามี rc
+    return new Promise(function (ok) {
+      if (!u) return ok(u);
+      var im = new Image();
+      im.onload = function () {
+        var w = im.naturalWidth, h = im.naturalHeight, x = 0, y = 0;
+        if (rc) { x = .395 * w; y = .103 * h; w = .195 * w; h = .157 * h; }
+        var k = Math.max(W / w, H / h), sw = W / k, sh = H / k;
+        x += (w - sw) / 2; y += (h - sh) / 2;
+        var c = document.createElement('canvas'); c.width = W * 2; c.height = H * 2;
+        c.getContext('2d').drawImage(im, x, y, sw, sh, 0, 0, c.width, c.height);
+        ok(c.toDataURL('image/jpeg', .9));
+      };
+      im.onerror = function () { ok(null); };
+      im.src = u;
+    });
+  }
+  function crop(u) { // ตัดเฉพาะใบหน้าจากแบบฟอร์มทะเบียนประวัติ
+    return new Promise(function (ok) {
+      var im = new Image();
+      im.onload = function () {
+        var w = im.naturalWidth, h = im.naturalHeight, c = document.createElement('canvas');
+        var x = .395 * w, y = .103 * h, cw = .195 * w, ch = .157 * h;
+        c.width = Math.round(cw); c.height = Math.round(ch);
+        c.getContext('2d').drawImage(im, x, y, cw, ch, 0, 0, c.width, c.height);
+        ok(c.toDataURL('image/jpeg', .92));
+      };
+      im.onerror = function () { ok(u); };
+      im.src = u;
+    });
+  }
+  var h2i = null;
+  function loadH2i() {
+    if (window.htmlToImage) return Promise.resolve(window.htmlToImage);
+    if (h2i) return h2i;
+    h2i = new Promise(function (ok, no) {
+      var sc = document.createElement('script');
+      sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.11/html-to-image.min.js';
+      sc.onload = function () { ok(window.htmlToImage); };
+      sc.onerror = function () { h2i = null; no(new Error('html-to-image')); };
+      document.head.appendChild(sc);
+    });
+    return h2i;
+  }
+  var h2c = null;
+  function loadH2c() {
+    if (window.html2canvas) return Promise.resolve(window.html2canvas);
+    if (h2c) return h2c;
+    h2c = new Promise(function (ok, no) {
+      var sc = document.createElement('script');
+      sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
+      sc.onload = function () { ok(window.html2canvas); };
+      sc.onerror = function () { h2c = null; no(new Error('html2canvas')); };
+      document.head.appendChild(sc);
+    });
+    return h2c;
+  }
+  function render(d) {
+    var nt = Math.max(1, (d.targets || []).length), tw = Math.floor((1012 - 40 - 14 * (nt - 1)) / nt) - 6;
+    var jobs = (d.targets || []).map(function (t) { return fit(t.photo, tw, Math.round(tw * 8 / 7), t.reg).then(function (u) { t.photo = u; }); });
+    (d.stages || []).forEach(function (s) { s.photos = (s.photos || []).slice(0, 2); s.photos.forEach(function (u, i) { jobs.push(fit(u, 199, 144).then(function (v) { s.photos[i] = v; })); }); });
+    return Promise.all(jobs).then(function () { (d.stages || []).forEach(function (s) { s.photos = s.photos.filter(Boolean); }); }).then(loadH2c).then(function (lib) {
+      var host = document.createElement('div');
+      host.style.cssText = 'position:fixed;left:-20000px;top:0;width:1080px';
+      var el = document.createElement('div'); el.id = 'pst'; el.innerHTML = html(d);
+      host.appendChild(el); document.body.appendChild(host);
+      var fonts = document.fonts && document.fonts.load ? Promise.all(['700 52px "Chakra Petch"', '400 21px "Bai Jamjuree"', '600 16px "Bai Jamjuree"'].map(function (f) { return document.fonts.load(f, 'สารตั้งต้น'); })).catch(function () {}) : Promise.resolve();
+      function viaH2c() {
+        return lib(el, { scale: 1, backgroundColor: '#07080f', useCORS: true, logging: false }).then(function (cv) {
+          return new Promise(function (ok, no) { cv.toBlob(function (b) { b ? ok(b) : no(new Error('png')); }, 'image/png'); });
+        });
+      }
+      return fonts.then(loadH2i).then(function (hi) {
+        return hi.toBlob(el, { pixelRatio: 1, width: 1080, height: el.offsetHeight, backgroundColor: '#07080f', cacheBust: false });
+      }).then(function (b) { if (!b || b.size < 20000) throw new Error('blank'); return b; })
+        .catch(function (e) { el.innerHTML = el.innerHTML.replace(/box-shadow:[^;}]*/g, 'box-shadow:none'); return viaH2c(); })
+        .then(function (b) { document.body.removeChild(host); return b; }, function (err) { document.body.removeChild(host); throw err; });
+    });
+  }
+  return { html: html, render: render };
+})();
+</script>
