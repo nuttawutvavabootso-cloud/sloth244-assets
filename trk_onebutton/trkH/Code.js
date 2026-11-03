@@ -1600,12 +1600,12 @@ var Api = (function () {
     return withLock(function () {
       var crs = bchFindCases_(full);
       if (crs.length !== 1) return { ok: true, skipped: crs.length ? 'ผูกกับหลายเคส' : 'ไม่มีเคสที่ผูก', bch: full, caseIds: crs.map(function (c) { return c.id; }) };
-      var cr = crs[0], blobs = p.blobs || {};
+      var cr = crs[0], short = full.split('-').slice(0, 2).join('-'), blobs = p.blobs || {};
       if (p.unchanged && !Object.keys(blobs).length) {
         bchMarkItem_(reqId, cr.id, 'unchanged', false);
         return { ok: true, caseId: cr.id, unchanged: true };
       }
-      var res = bchIngestCase_(cr, full, p.ongoing || {}, p.dash || {}, blobs, p.contentHash);
+      var res = bchIngestCase_(cr, short, p.ongoing || {}, p.dash || {}, blobs, p.contentHash);
       delete res.snap;
       bchMarkItem_(reqId, cr.id, 'done', !!res.changed);
       return { ok: true, caseId: cr.id, result: res };
@@ -1653,10 +1653,7 @@ var Api = (function () {
     var bchId = bchMapFor_(caseRow);
     if (!bchId) throw new Error('เคสนี้ยังไม่ได้ผูก bchCaseId จึงไม่ดึงข้อมูล');
     var cur = bchReadUpdate_();
-    if (cur && !cur.doneAt && Date.now() - cur.ms < 5 * 60 * 1000) {
-      if (cur.caseId === caseRow.id) return { reqId: cur.id, joined: true, bchCaseId: bchId };
-      throw new Error('มีคำขอดึงข้อมูลเคสอื่นค้างอยู่ กรุณารอให้เสร็จก่อน');
-    }
+    if (cur && !cur.doneAt && cur.caseId === caseRow.id && Date.now() - cur.ms < 4 * 60 * 1000) return { reqId: cur.id, joined: true, bchCaseId: bchId };
     var index = bchKnownIndex_().filter(function (row) { return row.caseId === caseRow.id; });
     var req = { id: newId('bup'), ms: Date.now(), at: nowIso(), by: user.name, caseId: caseRow.id, bchCaseId: bchId, index: index };
     bchWriteUpdate_(req);
@@ -1751,7 +1748,7 @@ var Api = (function () {
         var cr = crs[0];
         if (!cr) { out.push({ bch: full, skipped: 'ไม่มีเคสที่ผูก' }); return; }
         var d = (p.dash || []).filter(function (r) { return String(r[''] || r['รหัสคดี'] || '') === full; })[0] || {}; // จับคู่ด้วยรหัสคดี บช. เท่านั้น ห้ามจับด้วยชื่อ
-        out.push(bchIngestCase_(cr, full, o, d, p.blobs));
+        out.push(bchIngestCase_(cr, short, o, d, p.blobs));
       });
       writeLog({ id: 'box', name: 'bch-sync' }, 'bch-pull', JSON.stringify(out).slice(0, 480));
     });
@@ -1771,6 +1768,7 @@ var Api = (function () {
     bchKeyOk_(key);
     var caseRow = findCase(String(caseId || ''));
     var local = bchCaseLocal_(caseRow.id), ph = { entries: {}, targets: {}, bch: {} };
+    local.entries.forEach(function (e) { if (e.photoIds) ph.entries[e.id] = e.photoIds.split(',').map(cachedDataUrl).filter(Boolean); });
     local.targets.forEach(function (t) { if (t.photoId) { var u = cachedDataUrl(t.photoId); if (u) ph.targets[t.id] = u; } });
     var row = bchDataRow_(caseRow.id), snap = {}; try { snap = JSON.parse(row && row.snapshot || '{}'); } catch (e) {}
     Object.keys(snap.photos || {}).forEach(function (t) { var u = cachedDataUrl(snap.photos[t]); if (u) ph.bch[t] = u; });
@@ -1779,25 +1777,7 @@ var Api = (function () {
     var tx = {}; data.targets.forEach(function (t) { tx[t.id] = parseExt_(t.ext); });
     (wb.targets || []).forEach(function (t) { t.ext = tx[t.id] || {}; });
     var byId = {}; local.entries.forEach(function (e) { byId[e.id] = e; });
-    local.entries = (wb.entries || []).map(function (e) {
-      var o = byId[e.id] || {};
-      var ids = String(o.photoIds || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean);
-      var names = ids.map(function (id) {
-        try { return DriveApp.getFileById(id).getName(); } catch (err) { return ''; }
-      });
-      if (ids.length) {
-        ph.entries[e.id] = ids.map(function (id, i) {
-          var url = cachedDataUrl(id);
-          return url ? { url: url, name: names[i] || '' } : null;
-        }).filter(Boolean);
-      }
-      return {
-        id: e.id, entryDate: e.entryDate, eventTime: e.eventTime, entryDateText: e.entryDateText, text: e.text,
-        stage: String(e.stage || ''), stageLabel: e.stageLabel, people: (e.people || []).join(', '),
-        phones: (e.phones || []).join(', '), plates: (e.plates || []).join(', '), photoIds: o.photoIds || '',
-        photoNames: names, authorName: e.authorName, createdAt: o.createdAt || ''
-      };
-    });
+    local.entries = (wb.entries || []).map(function (e) { var o = byId[e.id] || {}; return { id: e.id, entryDate: e.entryDate, eventTime: e.eventTime, entryDateText: e.entryDateText, text: e.text, stage: String(e.stage || ''), stageLabel: e.stageLabel, people: (e.people || []).join(', '), phones: (e.phones || []).join(', '), plates: (e.plates || []).join(', '), photoIds: o.photoIds || '', authorName: e.authorName }; });
     return { caseId: caseRow.id, caseName: caseRow.name, title: caseTitle(caseRow), ext: parseExt_(caseRow.ext), local: local, photos: ph, snap: snap, persons: casePersons_(wb, snap, data), pageCount: { entries: (wb.entries || []).length, targets: (wb.targets || []).length } };
   }
   function bchSyncDone(key, reqId) {
