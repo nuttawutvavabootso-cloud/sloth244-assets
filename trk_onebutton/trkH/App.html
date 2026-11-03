@@ -1,0 +1,1535 @@
+<script>
+(function () {
+  'use strict';
+
+  var SESSION_KEY = 'investigation.session';
+  var STAGE_LABELS = {
+    1: 'ได้ข่าว',
+    2: 'พิสูจน์ทราบตัวบุคคล',
+    3: 'เฝ้าติดตาม',
+    4: 'รวบรวมหลักฐาน/ขอหมายจับ',
+    5: 'จับกุมแล้ว'
+  };
+  var session = null;
+  var currentView = 'login';
+  var currentCaseId = '';
+  var currentBundle = null;
+  var selectedStage = 0;
+  var editingEntryId = null;
+  var photoReq = 0;
+  var toastTimer = null;
+
+  function $(id) { return document.getElementById(id); }
+
+  function el(tag, attrs, children) {
+    var node = document.createElement(tag);
+    var props = attrs || {};
+    Object.keys(props).forEach(function (key) {
+      if (key === 'class') node.className = props[key];
+      else if (key === 'text') node.textContent = props[key];
+      else if (props[key] != null && props[key] !== false) node.setAttribute(key, String(props[key]));
+    });
+    (children || []).forEach(function (child) { if (child) node.appendChild(child); });
+    return node;
+  }
+
+  function clear(node) {
+    while (node.firstChild) node.removeChild(node.firstChild);
+  }
+
+  function messageOf(err) {
+    if (!err) return 'เกิดข้อผิดพลาด';
+    var t = typeof err === 'string' ? err : (err.message || 'เกิดข้อผิดพลาด');
+    return String(t).replace(/^(\s*(Exception|Error|TypeError)\s*:\s*)+/i, '') || 'เกิดข้อผิดพลาด';
+  }
+
+  function call(name, args) {
+    return new Promise(function (resolve, reject) {
+      if (!window.google || !google.script || !google.script.run) {
+        reject(new Error('เปิดผ่านเว็บแอปที่ติดตั้งแล้ว'));
+        return;
+      }
+      var run = google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler(function (err) { reject(new Error(messageOf(err))); });
+      run[name].apply(run, args || []);
+    });
+  }
+
+  function toast(text) {
+    var node = $('toast');
+    node.textContent = text;
+    node.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { node.hidden = true; }, 2600);
+  }
+
+  function safeHttp(url) {
+    var text = String(url || '').trim();
+    if (!/^https?:\/\//i.test(text)) return '';
+    return text;
+  }
+
+  function safeImg(src) {
+    if (!src) return '';
+    if (/^data:image\/(jpeg|png|webp);base64,/i.test(src)) return src;
+    if (/^\/sample\/photos\/[a-z0-9.-]+$/i.test(src)) return src;
+    return '';
+  }
+
+  function show(view) {
+    ['login', 'home', 'case', 'form'].forEach(function (name) {
+      $('view-' + name).hidden = name !== view;
+    });
+    currentView = view;
+    $('who').hidden = view === 'login';
+    syncDock();
+    window.scrollTo(0, 0);
+  }
+
+  function syncDock() {
+    var onCase = currentView === 'case';
+    var closed = !!(currentBundle && currentBundle.card && currentBundle.card.status === 'closed');
+    $('dock').hidden = currentView === 'login';
+    $('logout').hidden = currentView === 'login';
+    $('btn-back').hidden = !onCase;
+    $('btn-add-entry').hidden = !onCase || closed;
+    $('btn-edit-next').hidden = !onCase || closed;
+  }
+
+  function applyRole() {
+    var boss = session && session.user && session.user.role === 'boss';
+    $('btn-summary').hidden = !boss;
+    var name = $('who-name');
+    clear(name);
+    if (!session) return;
+    name.appendChild(document.createTextNode(session.user.name));
+    if (boss) name.appendChild(el('span', { class: 'role-pill', text: 'ผู้บังคับบัญชา' }));
+  }
+
+  function todayInput() {
+    var parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Bangkok',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).formatToParts(new Date());
+    function pick(type) {
+      return parts.filter(function (part) { return part.type === type; })[0].value;
+    }
+    return pick('year') + '-' + pick('month') + '-' + pick('day');
+  }
+
+  function stageBar(stage) {
+    var bar = el('div', { class: 'bar', role: 'img', 'aria-label': 'ขั้น ' + stage + ' จาก 5' });
+    var i;
+    for (i = 1; i <= 5; i += 1) {
+      bar.appendChild(el('span', { class: i <= stage ? 'on' : '', text: String(i), title: STAGE_LABELS[i] }));
+    }
+    return bar;
+  }
+
+  function chips(items) {
+    if (!items || !items.length) return null;
+    var wrap = el('div', { class: 'chips' });
+    items.forEach(function (item) { wrap.appendChild(el('span', { class: 'chip', text: item })); });
+    return wrap;
+  }
+
+  var syncingIds = {};
+  function syncLine(text) {
+    return el('p', { class: 'sync-line' }, [
+      el('span', { class: 'spinner', 'aria-hidden': 'true' }),
+      document.createTextNode(' ' + text)
+    ]);
+  }
+  function cardNode(card) {
+    var closed = card.status === 'closed';
+    var node = el('article', {
+      class: 'card ' + (closed ? 'closed' : 'open'),
+      id: 'card-' + card.id,
+      role: 'button',
+      tabindex: '0',
+      'aria-label': card.name + (closed ? ' ปิดแล้ว' : ' กำลังติดตาม')
+    });
+    if (card.bchLinked) node.setAttribute('data-bch', '1');
+    if (syncingIds[card.id]) node.setAttribute('aria-busy', 'true');
+    var head = el('div', { class: 'card-head' });
+    head.appendChild(el('h2', { text: card.name }));
+    if (closed) head.appendChild(el('span', { class: 'status-check', text: '✓', 'aria-hidden': 'true' }));
+    node.appendChild(head);
+    node.appendChild(el('p', { text: 'เป้าหมาย: ' + card.mainTarget }));
+    node.appendChild(stageBar(card.stage));
+    node.appendChild(el('p', { text: card.stageLabel }));
+    node.appendChild(el('p', { class: 'note', text: (card.lastUpdateText || '—') + ' · ' + card.latestNote }));
+    if (syncingIds[card.id]) node.appendChild(syncLine('กำลังดึงข้อมูลคดีนี้…'));
+    function open() { openCase(card.id); }
+    node.addEventListener('click', open);
+    node.addEventListener('keydown', function (event) {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); open(); }
+    });
+    return node;
+  }
+  function renderCards(cards) {
+    var list = $('card-list');
+    clear(list);
+    if (!cards.length) {
+      var empty = $('show-closed').checked ? 'ยังไม่มีเคส' : 'ยังไม่มีเคสที่เปิดอยู่';
+      list.appendChild(el('p', { class: 'muted', text: empty }));
+      return;
+    }
+    cards.forEach(function (card) { list.appendChild(cardNode(card)); });
+  }
+  function replaceCard(card) {
+    var old = document.getElementById('card-' + card.id);
+    if (!old) return;
+    old.replaceWith(cardNode(card));
+  }
+
+  function outcomeEditor(target, outcomes) {
+    var select = el('select', { 'aria-label': 'สถานะเป้าหมาย' });
+    outcomes.forEach(function (o) {
+      var opt = el('option', { value: o.id, text: o.label });
+      if (o.id === target.outcome) opt.selected = true;
+      select.appendChild(opt);
+    });
+    var date = el('input', { type: 'date', 'aria-label': 'วันที่ (ไม่บังคับ)' });
+    date.value = target.outcomeDate || '';
+    var note = el('input', { type: 'text', maxlength: '500', placeholder: 'หมายเหตุ เช่น หน่วยที่จับ', 'aria-label': 'หมายเหตุ' });
+    note.value = target.outcomeNote || '';
+    var save = el('button', { type: 'button', class: 'btn ghost', text: 'บันทึกสถานะ' });
+    save.addEventListener('click', function (event) {
+      event.stopPropagation();
+      save.disabled = true;
+      call('updateTargetOutcome', [session.token, target.id, { outcome: select.value, outcomeDate: date.value, outcomeNote: note.value }])
+        .then(function () { toast('บันทึกสถานะแล้ว'); refreshFilesInBackground(currentCaseId); return call('getCase', [session.token, currentCaseId]); })
+        .then(function (b) { if (b) { renderCase(b); setTargetsOpen(true); } })
+        .catch(function (err) { save.disabled = false; toast(err.message); });
+    });
+    [select, date, note].forEach(function (n) { n.addEventListener('click', function (e) { e.stopPropagation(); }); });
+    return el('div', { class: 'outcome-edit' }, [select, date, note, save]);
+  }
+
+  function renderCase(bundle) {
+    currentBundle = bundle;
+    var card = bundle.card;
+    var closed = card.status === 'closed';
+    $('case-kicker').textContent = card.statusLabel + ' · เปิดเมื่อ ' + (card.openedText || '');
+    $('case-name').textContent = card.name;
+    $('case-detail').textContent = card.detail || '';
+    var stageHost = $('case-stage');
+    clear(stageHost);
+    stageHost.appendChild(stageBar(card.stage));
+    $('case-stage-label').textContent = card.stageLabel;
+    var meta = 'อัปเดตล่าสุด ' + (card.lastUpdateText || '—');
+    if (!closed && bundle.closable) meta += ' · เป้าหมายครบแล้ว ปิดเคสได้ (บันทึกขั้น 5)';
+    $('case-meta').textContent = meta;
+    $('case-next').textContent = card.nextStep || 'ยังไม่ระบุขั้นต่อไป';
+    $('btn-add-target').hidden = closed;
+    renderExtSummary(bundle);
+    $('arrest-box').hidden = !closed;
+    $('case-arrest-url').value = card.arrestRecordUrl || '';
+    var linkHost = $('arrest-link');
+    clear(linkHost);
+    var url = safeHttp(card.arrestRecordUrl);
+    if (url) {
+      var anchor = el('a', { href: url, target: '_blank', rel: 'noopener noreferrer', text: url });
+      linkHost.appendChild(anchor);
+    } else {
+      linkHost.textContent = 'ยังไม่ได้ใส่ลิงก์';
+    }
+
+    var targets = $('target-list');
+    clear(targets);
+    if (!bundle.targets.length) targets.appendChild(el('p', { class: 'muted', text: 'ยังไม่มีเป้าหมาย' }));
+    bundle.targets.forEach(function (target) {
+      var photoSrc = safeImg(target.photoSrc);
+      var photo = photoSrc ? el('img', { src: photoSrc, alt: '' }) : el('div', { class: 'nophoto', text: 'ไม่มีรูป' });
+      photo.setAttribute('data-target-photo', target.id);
+      var detail = el('div', { class: 'person-detail' });
+      var PL = ((bundle.persons || []).filter(function (x) { return x.id === target.id; })[0] || {}).lines || [];
+      PL.forEach(function (f) { detail.appendChild(el('p', { class: f[0] === 'สถานะ' ? 'outcome-line' : '' }, [el('span', { class: 'k', text: f[0] + ': ' }), document.createTextNode(f[1])])); });
+      /* อ่านอย่างเดียว: แก้สถานะเป้าหมายที่ระบบ บช. */
+      var body = el('div', { class: 'person-body' }, [
+        el('strong', { class: 'person-name', text: target.name }),
+        detail
+      ]);
+      var caught = /^caught/.test(String(target.outcome || ''));
+      var photoBox = caught ? el('span', { class: 'photo-wrap' }, [photo, el('span', { class: 'arrest-band', text: 'จับกุมแล้ว' })]) : photo;
+      targets.appendChild(el('article', { class: 'person' + (target.arrested ? '' : ' live') }, [photoBox, body]));
+    });
+
+    (bundle.persons || []).filter(function (x) { return x.src === 'บช.'; }).forEach(function (x) {
+      var d = el('div', { class: 'person-detail' });
+      x.lines.forEach(function (f) { d.appendChild(el('p', {}, [el('span', { class: 'k', text: f[0] + ': ' }), document.createTextNode(f[1])])); });
+      targets.appendChild(el('article', { class: 'person live' }, [el('div', { class: 'nophoto', text: 'บช.' }), el('div', { class: 'person-body' }, [el('strong', { class: 'person-name', text: x.name + ' (ข้อมูล บช.)' }), d])]));
+    });
+
+    var entries = $('entry-list');
+    clear(entries);
+    if (!bundle.entries.length) entries.appendChild(el('p', { class: 'muted', text: 'ยังไม่มีความคืบหน้า' }));
+    bundle.entries.forEach(function (entry) {
+      var block = el('article', { class: 'step' });
+      block.appendChild(el('p', { class: 'when', text: entry.entryDateText }));
+      block.appendChild(el('h3', { text: 'ขั้น ' + entry.stage + ' · ' + entry.stageLabel }));
+      block.appendChild(el('p', { text: entry.text }));
+      [chips(entry.phones), chips(entry.plates), chips(entry.people)].forEach(function (node) {
+        if (node) block.appendChild(node);
+      });
+      if (entry.photoCount) {
+        var row = el('div', { class: 'shots', 'data-entry-photos': entry.id });
+        row.appendChild(el('p', { class: 'muted', text: 'กำลังโหลดรูป ' + entry.photoCount + ' รูป…' }));
+        block.appendChild(row);
+      }
+      block.appendChild(el('p', { class: 'by', text: entry.authorName + ' · บันทึก ' + entry.createdAtText }));
+      entries.appendChild(block);
+    });
+    var stage5 = document.querySelector('#stage-picker button[data-stage="5"]');
+    if (stage5) {
+      stage5.disabled = !bundle.closable;
+      stage5.title = bundle.closable ? '' : 'ปิดเคสได้เมื่อเป้าหมายทุกคนจับแล้ว หน่วยอื่นจับ หรือเสียชีวิต';
+    }
+    setTargetsOpen(false);
+    show('case');
+  }
+
+  function setTargetsOpen(open) {
+    var board = $('case-board');
+    if (!board) return;
+    board.classList.toggle('targets-open', !!open);
+  }
+
+  function loadHome(silent) {
+    if (!session) return Promise.resolve();
+    if (!silent) $('home-status').textContent = 'กำลังโหลดเคส…';
+    return call('listCases', [session.token, $('show-closed').checked]).then(function (res) {
+      $('home-status').textContent = '';
+      $('home-error').hidden = true;
+      renderCards(res.cards || []);
+    }).catch(function (err) {
+      if (/เซสชัน|เข้าสู่ระบบ/.test(err.message)) {
+        logout(true);
+        showLoginError(err.message);
+        return;
+      }
+      $('home-status').textContent = '';
+      $('home-error').hidden = false;
+      $('home-error').textContent = err.message;
+    });
+  }
+
+  var homePullBusy = false;
+  function paintCaseSync(id) {
+    var node = $('case-sync');
+    if (!node || currentCaseId !== id) return;
+    if (syncingIds[id]) {
+      node.hidden = false;
+      clear(node);
+      node.appendChild(el('span', { class: 'spinner', 'aria-hidden': 'true' }));
+      node.appendChild(document.createTextNode(' กำลังดึงข้อมูลคดีนี้…'));
+    } else {
+      node.hidden = true;
+    }
+  }
+  function finishSync() {
+    Object.keys(syncingIds).forEach(function (id) { delete syncingIds[id]; });
+    document.querySelectorAll('#card-list .sync-line').forEach(function (node) { node.remove(); });
+    document.querySelectorAll('#card-list [aria-busy="true"]').forEach(function (node) { node.removeAttribute('aria-busy'); });
+    var banner = $('case-sync');
+    if (banner) banner.hidden = true;
+  }
+  function refreshCard(caseId, changed) {
+    call('getCaseCard', [session.token, caseId]).then(function (card) {
+      if (card) replaceCard(card);
+      paintCaseSync(caseId);
+      if (changed && currentCaseId === caseId && currentView === 'case') {
+        call('getCase', [session.token, caseId]).then(function (bundle) {
+          if (currentCaseId !== caseId || !bundle) return;
+          renderCase(bundle);
+          loadPhotos(caseId);
+        }).catch(function () { /* keep the case already on screen */ });
+      }
+    }).catch(function () {
+      var node = document.getElementById('card-' + caseId);
+      var line = node && node.querySelector('.sync-line');
+      if (line) line.remove();
+    });
+  }
+  function watchSync(reqId) {
+    var seen = {};
+    return new Promise(function (resolve, reject) {
+      var until = Date.now() + 180000;
+      (function tick() {
+        call('bchSyncProgress', [session.token, reqId]).then(function (status) {
+          (status.items || []).forEach(function (item) {
+            if (!item || seen[item.caseId] || item.state === 'queued') return;
+            seen[item.caseId] = 1;
+            delete syncingIds[item.caseId];
+            refreshCard(item.caseId, !!item.changed);
+          });
+          if (status.done) {
+            if (status.ok === false && status.err) reject(new Error(status.err));
+            else resolve();
+            return;
+          }
+          if (Date.now() > until) { reject(new Error('timeout')); return; }
+          setTimeout(tick, 1200);
+        }).catch(reject);
+      })();
+    });
+  }
+  function openCase(id, fromPop) {
+    if (!fromPop) { try { var hs = history.state || {}; if (hs.trk === 'case') history.replaceState({ trk: 'case', id: id }, ''); else history.pushState({ trk: 'case', id: id }, ''); } catch (e) {} }
+    currentCaseId = id; try { sessionStorage.setItem('trk_cur_case', id); } catch (e) {}
+    $('case-name').textContent = 'กำลังเปิดเคส…';
+    var updateStatus = $('update-status');
+    if (updateStatus) updateStatus.textContent = '';
+    show('case');
+    call('getCase', [session.token, id]).then(function (b) { renderCase(b); loadPhotos(id); loadFilesStatus(id); loadBchSync(id); loadBchData(id, false); loadCaseOutputs(id); paintCaseSync(id); }).catch(function (err) {
+      toast(err.message);
+      show('home');
+    });
+  }
+
+  function loadPhotos(id) {
+    var req = ++photoReq;
+    call('getCasePhotos', [session.token, id]).then(function (res) {
+      if (req !== photoReq || currentCaseId !== id || !res) return;
+      Object.keys(res.entries || {}).forEach(function (eid) {
+        var host = document.querySelector('[data-entry-photos="' + eid + '"]');
+        if (!host) return;
+        clear(host);
+        (res.entries[eid] || []).map(safeImg).filter(Boolean).forEach(function (src) { host.appendChild(el('img', { src: src, alt: '' })); });
+      });
+      Object.keys(res.targets || {}).forEach(function (tid) {
+        var src = safeImg(res.targets[tid]);
+        var node = document.querySelector('[data-target-photo="' + tid + '"]');
+        if (!src || !node) return;
+        var img = el('img', { src: src, alt: '' });
+        img.setAttribute('data-target-photo', tid);
+        node.parentNode.replaceChild(img, node);
+      });
+      document.querySelectorAll('[data-entry-photos] p.muted').forEach(function (p) { p.textContent = 'ไม่มีรูปที่แสดงได้'; });
+    }).catch(function () {
+      document.querySelectorAll('[data-entry-photos] p.muted').forEach(function (p) { p.textContent = 'โหลดรูปไม่สำเร็จ'; });
+    });
+  }
+
+  function openEditEntry(entry) {
+    openForm('entry');
+    editingEntryId = entry.id;
+    $('form-title').textContent = 'แก้ไขขั้นตอน';
+    $('entry-date').value = String(entry.entryDate || '').slice(0, 10);
+    $('entry-time').value = entry.eventTime || '';
+    $('entry-text').value = entry.text || '';
+    $('entry-phones').value = (entry.phones || []).join(', ');
+    $('entry-plates').value = (entry.plates || []).join(', ');
+    $('entry-people').value = (entry.people || []).join(', ');
+    selectedStage = Number(entry.stage) || 0;
+    paintStages();
+    var s5 = document.querySelector('#stage-picker button[data-stage="5"]');
+    if (s5) s5.disabled = true;
+    $('entry-photo-box').hidden = true;
+    $('entry-edit-note').hidden = false;
+    $('entry-submit').textContent = 'บันทึกการแก้ไข';
+  }
+
+  function showLoginError(text) {
+    var node = $('login-error');
+    node.hidden = !text;
+    node.textContent = text || '';
+  }
+
+  function fillUserSelect(users) {
+    var current = $('user-id');
+    var next = current.cloneNode(false);
+    next.id = 'user-id';
+    next.name = 'user';
+    next.required = true;
+    var list = users || [];
+    next.add(new Option('เลือกชื่อเจ้าหน้าที่', ''));
+    list.forEach(function (user) {
+      if (!user || !user.name) return;
+      next.add(new Option(user.name, user.id || user.name));
+    });
+    next.add(new Option('อื่นๆ (กรอกเอง)', '__other__'));
+    current.parentNode.replaceChild(next, current);
+  }
+
+  var ROSTER = [
+    { id: 'u-surriya', name: 'ร.ต.อ.สุริยา วรรณพฤกษ์' },
+    { id: 'u-sittichai', name: 'ด.ต.สิทธิชัย วงศ์ธรรม' },
+    { id: 'u-amarin', name: 'ส.ต.อ.อัมรินทร์ พรมเมืองขวา' },
+    { id: 'u-kanasawat', name: 'ด.ต.คณาสวัสดิ์ อาจวิชัย' },
+    { id: 'u-rapeerat', name: 'จ.ส.ต.รพีรัฐ ปัดเกษม' },
+    { id: 'u-atchariya', name: 'จ.ส.ต.อัจฉะริยะ จักรเรืองชัย' },
+    { id: 'u-aniwat', name: 'ส.ต.อ.อนิวัฒน์ พลตื้อ' },
+    { id: 'u-chittiwat', name: 'ส.ต.อ.จิตรทิวัส แก้วหลวง' },
+    { id: 'u-nattawut', name: 'จ.ส.ต.ณัฐวุฒิ บุตรโส' }
+  ];
+  fillUserSelect(ROSTER);
+
+  function logout(silent) {
+    session = null;
+    currentBundle = null;
+    currentCaseId = '';
+    sessionStorage.removeItem(SESSION_KEY);
+    applyRole();
+    if (!silent) show('login');
+  }
+
+
+  // ===== ข้อมูลรายงาน บช.ตชด. =====
+  var EXT_TYPES = [['A','A ยาเสพติด'],['B','B หลบหนีเข้าเมือง/ค้ามนุษย์'],['C','C ทรัพยากรป่าไม้'],['D','D สินค้าหนีภาษี'],['E','E ความมั่นคง'],['F','F อื่นๆ'],['U','U ไม่ทราบ']];
+  var EXT_STATUS = ['กำลังดำเนินการ', 'เสร็จสิ้น'];
+  var EXT_URL = 'https://script.google.com/macros/s/AKfycbznIfamZANZAR6yQPNGdwvpzRGvlRflARViZL6icF07tbQFB0sl1xLUQ6eZtEo_FP1aSA/exec';
+  var EXT_RANKS = ['พล.ต.อ.','พล.ต.ท.','พล.ต.ต.','พ.ต.อ.','พ.ต.ท.','พ.ต.ต.','ร.ต.อ.','ร.ต.ท.','ร.ต.ต.','ด.ต.','จ.ส.ต.','ส.ต.อ.','ส.ต.ท.','ส.ต.ต.'];
+  var EXT_LEADER = { rank: 'ร.ต.อ.', first: 'สุริยา', last: 'วรรณพฤกษ์', phone: '' };
+  var extHandle = null, caseExtHandle = null;
+
+  function splitPerson(full) {
+    var s = String(full || '').trim(), rank = '';
+    EXT_RANKS.slice().sort(function (a, b) { return b.length - a.length; }).some(function (r) {
+      if (s.indexOf(r) === 0) { rank = r; s = s.slice(r.length).trim(); return true; }
+      return false;
+    });
+    var parts = s.split(/\s+/).filter(Boolean);
+    return { rank: rank, first: parts[0] || '', last: parts.slice(1).join(' '), phone: '' };
+  }
+  function splitTargetName(full) {
+    var s = String(full || '').trim(), title = '';
+    ['นางสาว', 'นาย', 'นาง', 'น.ส.'].some(function (t) {
+      if (s.indexOf(t) === 0) { title = t === 'น.ส.' ? 'นางสาว' : t; s = s.slice(t.length).trim(); return true; }
+      return false;
+    });
+    var parts = s.split(/\s+/).filter(Boolean);
+    return { title: title, firstName: parts[0] || '', lastName: parts.slice(1).join(' ') };
+  }
+  function uniqJoin(list) {
+    var seen = {}, out = [];
+    list.forEach(function (v) { String(v || '').split(/[,،\n]+/).forEach(function (x) { x = x.trim(); if (x && !seen[x]) { seen[x] = 1; out.push(x); } }); });
+    return out.join(', ');
+  }
+  function listOf(v) { return Array.isArray(v) ? v : String(v || '').split(','); }
+
+  // ค่าเริ่มต้นจากข้อมูลเดิมของเคส (ไม่บันทึกจนกว่าจะกดบันทึก)
+  function extFromBundle(bundle) {
+    var card = (bundle && bundle.card) || {};
+    var saved = card.ext || {};
+    var phones = [], plates = [];
+    (bundle.targets || []).forEach(function (t) { phones.push(t.phones); });
+    (bundle.entries || []).forEach(function (e) { listOf(e.phones).forEach(function (p) { phones.push(p); }); listOf(e.plates).forEach(function (p) { plates.push(p); }); });
+    var plateList = uniqJoin(plates).split(', ').filter(Boolean);
+    var derived = {
+      startDate: String(card.createdAt || '').slice(0, 10),
+      caseType: '', linkedCaseId: '', bchCaseName: '',
+      vehicles: plateList.map(function (p) { return { make: '', model: '', color: '', plate: p }; }),
+      targetPhones: uniqJoin(phones), bankAccounts: '', gps: '', evidenceLogo: '',
+      extStatus: card.status === 'closed' ? 'เสร็จสิ้น' : 'กำลังดำเนินการ',
+      reporter: splitPerson(session && session.user && session.user.name),
+      leader: EXT_LEADER
+    };
+    var texts = [card.name, card.detail].concat((bundle.entries || []).map(function (e) { return e.text; })).join('\n');
+    derived.caseType = guessCaseType(card.name + ' ' + (card.detail || ''));
+    derived.bankAccounts = uniqJoin(matchAll(texts, /(?:บัญชี|บ\/ช|เลขบช)[^0-9\n]{0,25}(\d[\d-]{8,16}\d)/g));
+    derived.gps = uniqJoin(matchAll(texts, /(-?\d{1,2}\.\d{4,}\s*,\s*-?\d{2,3}\.\d{4,})/g));
+    if (!Object.keys(saved).length) return derived;
+    var out = {};
+    Object.keys(derived).forEach(function (k) {
+      var v = saved[k];
+      var empty = v == null || v === '' || (Array.isArray(v) && !v.length) || (typeof v === 'object' && !Array.isArray(v) && !Object.keys(v).some(function (q) { return v[q]; }));
+      out[k] = empty ? derived[k] : v;
+    });
+    Object.keys(saved).forEach(function (k) { if (!(k in out)) out[k] = saved[k]; });
+    return out;
+  }
+  function matchAll(text, re) { var out = [], m; re.lastIndex = 0; while ((m = re.exec(text))) out.push(m[1]); return out; }
+  function guessCaseType(t) {
+    t = String(t || '');
+    if (/ยาเสพติด|ยาบ้า|ไอซ์|เฮโรอีน|กัญชา|ยาไอซ์|เมทแอมเฟตามีน|คีตามีน|พืชกระท่อม/.test(t)) return 'A';
+    if (/หลบหนีเข้าเมือง|ต่างด้าว|ค้ามนุษย์|แรงงานเถื่อน/.test(t)) return 'B';
+    if (/ป่าไม้|ไม้พะยูง|บุกรุกป่า|สัตว์ป่า|ทรัพยากร/.test(t)) return 'C';
+    if (/หนีภาษี|ลักลอบนำเข้า|ศุลกากร|บุหรี่เถื่อน|สินค้าเถื่อน/.test(t)) return 'D';
+    if (/ความมั่นคง|ก่อการร้าย|อาวุธสงคราม|วัตถุระเบิด/.test(t)) return 'E';
+    return 'U';
+  }
+
+  function mkInput(label, value, attrs) {
+    var input = el('input', attrs || {});
+    input.value = value || '';
+    return { wrap: el('label', {}, [document.createTextNode(label), input]), input: input };
+  }
+  function mkSelect(label, options, value) {
+    var sel = el('select', {});
+    sel.appendChild(el('option', { value: '', text: '— เลือก —' }));
+    options.forEach(function (o) {
+      var v = Array.isArray(o) ? o[0] : o, t = Array.isArray(o) ? o[1] : o;
+      var op = el('option', { value: v, text: t });
+      if (v === value) op.selected = true;
+      sel.appendChild(op);
+    });
+    return { wrap: el('label', {}, [document.createTextNode(label), sel]), input: sel };
+  }
+
+  function buildExtFields(host, x) {
+    clear(host);
+    x = x || {};
+    var f = {};
+    f.startDate = mkInput('วันที่เริ่มคดี', x.startDate, { type: 'date' });
+    f.caseType = mkSelect('ประเภทคดี', EXT_TYPES, x.caseType);
+    f.linkedCaseId = mkInput('เชื่อมโยงคดีเดิม (ถ้ามี)', x.linkedCaseId, { maxlength: '100' });
+    f.bchCaseName = mkInput('ชื่อเคสนี้ในระบบ บช. (ถ้าเคยรายงานแล้ว)', x.bchCaseName, { maxlength: '200' });
+    [f.bchCaseName, f.startDate, f.caseType, f.linkedCaseId].forEach(function (k) { host.appendChild(k.wrap); });
+
+    host.appendChild(el('h3', { text: 'ยานพาหนะ' }));
+    var vHost = el('div', {});
+    host.appendChild(vHost);
+    var vRows = [];
+    function addVehicle(v) {
+      v = v || {};
+      var r = { make: mkInput('ยี่ห้อ', v.make, { maxlength: '60' }), model: mkInput('รุ่น', v.model, { maxlength: '60' }), color: mkInput('สีรถ', v.color, { maxlength: '40' }), plate: mkInput('ป้ายทะเบียนรถ', v.plate, { maxlength: '60' }) };
+      var box = el('div', { class: 'ext-sub' }, [el('p', { class: 'muted small', text: 'รถคันที่ ' + (vRows.length + 1) }), r.make.wrap, r.model.wrap, r.color.wrap, r.plate.wrap]);
+      vHost.appendChild(box);
+      vRows.push(r);
+    }
+    (x.vehicles && x.vehicles.length ? x.vehicles : [{}]).forEach(addVehicle);
+    var addBtn = el('button', { type: 'button', class: 'btn ghost small', text: '+ เพิ่มรถอีกคัน' });
+    addBtn.addEventListener('click', function () { addVehicle({}); });
+    host.appendChild(addBtn);
+
+    f.targetPhones = mkInput('เบอร์โทรศัพท์เป้าหมาย', x.targetPhones, { maxlength: '500' });
+    f.bankAccounts = mkInput('เลขบัญชีธนาคาร', x.bankAccounts, { maxlength: '500' });
+    f.gps = mkInput('พิกัดสถานที่/GPS', x.gps, { maxlength: '300' });
+    f.evidenceLogo = mkInput('ตราประทับ/โลโก้ บนของกลาง', x.evidenceLogo, { maxlength: '300' });
+    f.extStatus = mkSelect('สถานะคดีปัจจุบัน', EXT_STATUS, x.extStatus === 'ปิดคดีแล้ว' ? 'เสร็จสิ้น' : x.extStatus);
+    [f.targetPhones, f.bankAccounts, f.gps, f.evidenceLogo, f.extStatus].forEach(function (k) { host.appendChild(k.wrap); });
+
+    function personBlock(title, p) {
+      p = p || {};
+      var r = { rank: mkSelect('ยศ', EXT_RANKS, p.rank), first: mkInput('ชื่อ', p.first, { maxlength: '80' }), last: mkInput('นามสกุล', p.last, { maxlength: '80' }), phone: mkInput('เบอร์โทรศัพท์', p.phone, { maxlength: '30', inputmode: 'tel' }) };
+      host.appendChild(el('h3', { text: title }));
+      var pick = mkSelect('เลือกจากรายชื่อ ชปข.', (typeof ROSTER !== 'undefined' ? ROSTER : []).filter(function (u) { return u && u.name; }).map(function (u) { return [u.name, u.name]; }), '');
+      pick.input.addEventListener('change', function () {
+        if (!pick.input.value) return;
+        var sp = splitPerson(pick.input.value);
+        r.rank.input.value = sp.rank; r.first.input.value = sp.first; r.last.input.value = sp.last;
+      });
+      host.appendChild(pick.wrap);
+      [r.rank, r.first, r.last, r.phone].forEach(function (k) { host.appendChild(k.wrap); });
+      return r;
+    }
+    var rep = personBlock('ผู้รายงาน', x.reporter);
+    var lead = personBlock('หัวหน้าชุด', x.leader);
+    function pv(r) { return { rank: r.rank.input.value, first: r.first.input.value, last: r.last.input.value, phone: r.phone.input.value }; }
+    return {
+      value: function () {
+        return {
+          startDate: f.startDate.input.value, caseType: f.caseType.input.value, linkedCaseId: f.linkedCaseId.input.value, bchCaseName: f.bchCaseName.input.value,
+          vehicles: vRows.map(function (r) { return { make: r.make.input.value, model: r.model.input.value, color: r.color.input.value, plate: r.plate.input.value }; }),
+          targetPhones: f.targetPhones.input.value, bankAccounts: f.bankAccounts.input.value, gps: f.gps.input.value,
+          evidenceLogo: f.evidenceLogo.input.value, extStatus: f.extStatus.input.value, reporter: pv(rep), leader: pv(lead)
+        };
+      }
+    };
+  }
+
+  function buildExtTargets(host, targets) {
+    clear(host);
+    var rows = [];
+    if (!targets || !targets.length) return { value: function () { return []; } };
+    host.appendChild(el('h3', { text: 'เป้าหมาย (คำนำหน้า / ชื่อ / นามสกุล)' }));
+    targets.forEach(function (t, i) {
+      var x = t.ext && (t.ext.firstName || t.ext.lastName || t.ext.title) ? t.ext : splitTargetName(t.name);
+      var r = { id: t.id, title: mkSelect('คำนำหน้า', ['นาย', 'นาง', 'นางสาว', 'ไม่ทราบ'], x.title), first: mkInput('ชื่อ', x.firstName, { maxlength: '100' }), last: mkInput('นามสกุล', x.lastName, { maxlength: '100' }) };
+      r.orig = JSON.stringify(t.ext || {});
+      var info = 'เป้าหมายคนที่ ' + (i + 1) + ' · ' + t.name + (t.nickname ? ' · ฉายา ' + t.nickname : '') + (t.nationalIdText ? ' · ' + t.nationalIdText : '');
+      host.appendChild(el('div', { class: 'ext-sub' }, [el('p', { class: 'muted small', text: info }), r.title.wrap, r.first.wrap, r.last.wrap]));
+      rows.push(r);
+    });
+    return {
+      value: function () {
+        return rows.map(function (r) { return { id: r.id, orig: r.orig, ext: { title: r.title.input.value, firstName: r.first.input.value, lastName: r.last.input.value } }; });
+      }
+    };
+  }
+
+  function renderExtSummary(bundle) {
+    var x = (bundle.card && bundle.card.ext) || {};
+    var host = $('ext-summary');
+    if (!host) return;
+    if (!Object.keys(x).length) { host.textContent = 'ยังไม่ได้กรอก (กดกรอก/แก้ไข ระบบดึงข้อมูลเดิมมาให้)'; return; }
+    var type = (EXT_TYPES.filter(function (t) { return t[0] === x.caseType; })[0] || [0, '—'])[1];
+    host.textContent = (x.bchCaseName ? 'ผูกกับเคสใน บช.: ' + x.bchCaseName + ' · ' : 'ยังไม่ผูกกับเคสใน บช. · ') + 'ประเภท ' + type + ' · เริ่ม ' + (x.startDate || '—') + ' · ' + (x.extStatus || '—') + ' · รถ ' + ((x.vehicles || []).length) + ' คัน';
+  }
+
+
+  function extPayload(bundle) {
+    var card = bundle.card || {}, x = extFromBundle(bundle);
+    var digits = function (s) { return String(s || '').replace(/\D/g, ''); };
+    return {
+      v: 1, at: Date.now(), caseName: card.name || '',
+      startDate: x.startDate || '', caseType: x.caseType || '', relatedCase: x.linkedCaseId || '',
+      suspects: (bundle.targets || []).map(function (t) {
+        var e = t.ext && (t.ext.firstName || t.ext.lastName || t.ext.title) ? t.ext : splitTargetName(t.name);
+        return { title: e.title || '', fname: e.firstName || '', lname: e.lastName || '', alias: t.nickname || '', idcard: digits(t.nationalIdText || t.nationalId) };
+      }),
+      vehicles: (x.vehicles || []).map(function (v) { return { brand: v.make || '', model: v.model || '', color: v.color || '', plate: v.plate || '' }; }),
+      phone: x.targetPhones || '', bank: x.bankAccounts || '', location: x.gps || '', symbol: x.evidenceLogo || '',
+      status: x.extStatus === 'ปิดคดีแล้ว' ? 'เสร็จสิ้น' : (x.extStatus || ''),
+      rep: x.reporter || {}, com: x.leader || {}
+    };
+  }
+  function entryOrder(list) {
+    return (list || []).slice().sort(function (a, b) { return String(a.entryDate || '').localeCompare(String(b.entryDate || '')) || String(a.createdAt || '').localeCompare(String(b.createdAt || '')); });
+  }
+  function splitList(v) { return uniqJoin(listOf(v)).split(', ').filter(Boolean); }
+  function normPhone(p) { return String(p || '').replace(/\D/g, ''); }
+  // ข้อมูลเฉพาะที่ "ใหม่" ในความคืบหน้านี้ (ไม่เคยปรากฏในความคืบหน้าก่อนหน้า) — ไม่แต่งข้อมูล
+  function entryDelta(bundle, entry) {
+    var all = entryOrder(bundle.entries), idx = -1;
+    all.forEach(function (e, i) { if (e.id === entry.id) idx = i; });
+    var prev = idx > 0 ? all.slice(0, idx) : [];
+    var prevText = prev.map(function (e) { return e.text || ''; }).join('\n');
+    var seenPh = {}, seenPl = {};
+    prev.forEach(function (e) { splitList(e.phones).forEach(function (p) { seenPh[normPhone(p)] = 1; }); splitList(e.plates).forEach(function (p) { seenPl[p.replace(/\s/g, '')] = 1; }); });
+    var phones = splitList(entry.phones).filter(function (p) { return !seenPh[normPhone(p)]; });
+    var plates = splitList(entry.plates).filter(function (p) { return !seenPl[p.replace(/\s/g, '')]; });
+    var txt = String(entry.text || '');
+    var mentions = function (t, text) {
+      var n = splitTargetName(t.name), keys = [n.firstName && n.lastName ? n.firstName + ' ' + n.lastName : '', n.firstName && n.firstName.length > 2 ? n.firstName : '', t.nickname && String(t.nickname).length > 1 ? t.nickname : ''].filter(Boolean);
+      var ppl = splitList(entry.people).join(' ');
+      return keys.some(function (k) { return text.indexOf(k) >= 0 || (text === txt && ppl.indexOf(k) >= 0); });
+    };
+    var newTargets = (bundle.targets || []).filter(function (t) { return mentions(t, txt) && !mentions(t, prevText); });
+    var bank = uniqJoin(matchAll(txt, /(?:บัญชี|บ\/ช|เลขบช)[^0-9\n]{0,25}(\d[\d-]{8,16}\d)/g)).split(', ').filter(function (b) { return b && prevText.indexOf(b) < 0; });
+    var gps = uniqJoin(matchAll(txt, /(-?\d{1,2}\.\d{4,}\s*,\s*-?\d{2,3}\.\d{4,})/g)).split(', ').filter(function (g) { return g && prevText.indexOf(g) < 0; });
+    var isLast = idx === all.length - 1;
+    var line = function (e) { return (e.entryDateText ? e.entryDateText + ' ' : '') + (e.text || ''); };
+    return {
+      index: idx + 1, total: all.length, targets: newTargets, phones: phones, plates: plates, bank: bank, gps: gps,
+      closed: entry.stage === 5,
+      present: line(entry),
+      past: prev.map(line).join('\n'),
+      future: isLast && bundle.card && bundle.card.nextStep ? bundle.card.nextStep : '',
+      result: entry.stage === 5 ? (entry.text || '') : ''
+    };
+  }
+  function entryPayload(bundle, entry) {
+    var base = extPayload(bundle), x = extFromBundle(bundle), d = entryDelta(bundle, entry);
+    var digits = function (s) { return String(s || '').replace(/\D/g, ''); };
+    var bchName = x.bchCaseName || '';
+    base.mode = bchName ? 'update' : 'create';
+    base.bchCaseName = bchName;
+    base.entryLabel = 'ความคืบหน้าครั้งที่ ' + d.index + '/' + d.total + (entry.entryDateText ? ' (' + entry.entryDateText + ')' : '');
+    base.suspects = d.targets.map(function (t) {
+      var e = t.ext && (t.ext.firstName || t.ext.lastName || t.ext.title) ? t.ext : splitTargetName(t.name);
+      return { title: e.title || '', fname: e.firstName || '', lname: e.lastName || '', alias: t.nickname || '', idcard: digits(t.nationalIdText || t.nationalId) };
+    });
+    base.vehicles = d.plates.map(function (p) { return { brand: '', model: '', color: '', plate: p }; });
+    base.phone = d.phones.join(', '); base.bank = d.bank.join(', '); base.location = d.gps.join(', ');
+    base.status = d.closed ? 'เสร็จสิ้น' : 'กำลังดำเนินการ';
+    base.narr = { past: d.past, present: d.present, future: d.future, result: d.result, obstacle: '', need: '' };
+    if (base.mode === 'update') { base.caseName = ''; base.startDate = ''; base.caseType = ''; base.symbol = ''; }
+    return base;
+  }
+  function openBchPreview(entry) {
+    if (!currentBundle) return;
+    var p = entry ? entryPayload(currentBundle, entry) : extPayload(currentBundle);
+    pendingBchPayload = p;
+    var old = $('bch-modal'); if (old) old.remove();
+    var typeLabel = (EXT_TYPES.filter(function (t) { return t[0] === p.caseType; })[0] || ['', ''])[1];
+    var person = function (o) { return [o.rank, o.first, o.last].filter(Boolean).join(' ') + (o.phone ? ' โทร ' + o.phone : ''); };
+    var head = p.mode === 'update' ? 'อัปเดตเคสใน บช.: "' + p.bchCaseName + '"' : (entry ? 'ยังไม่ผูกกับเคสใน บช. — จะกรอกเป็น "รายงานคดีใหม่"' : '');
+    var rows = entry ? [
+      ['เคสใน บช.', p.mode === 'update' ? p.bchCaseName + ' (โหมดอัปเดตคดีเดิม)' : 'รายงานคดีใหม่: ' + p.caseName],
+      ['จากความคืบหน้า', p.entryLabel],
+      ['ผู้ต้องสงสัยใหม่', p.suspects.map(function (x) { return [x.title, x.fname, x.lname].filter(Boolean).join(' ') + (x.alias ? ' (' + x.alias + ')' : '') + (x.idcard ? ' ' + x.idcard : ''); }).join('\n')],
+      ['รถใหม่', p.vehicles.map(function (v) { return v.plate; }).join(', ')],
+      ['เบอร์ใหม่', p.phone], ['บัญชีใหม่', p.bank], ['พิกัดใหม่', p.location], ['สถานะ', p.status],
+      ['อดีต', p.narr.past], ['ปัจจุบัน', p.narr.present], ['อนาคต', p.narr.future], ['ผล', p.narr.result], ['ปัญหาอุปสรรค', ''], ['สิ่งที่ต้องการ', ''],
+      ['ผู้รายงาน', person(p.rep)], ['หัวหน้าชุด', person(p.com)]
+    ] : [
+      ['ชื่อคดี', p.caseName], ['ประเภท', typeLabel], ['วันที่เริ่ม', p.startDate],
+      ['ผู้ต้องสงสัย', p.suspects.map(function (x) { return [x.title, x.fname, x.lname].filter(Boolean).join(' ') + (x.alias ? ' (' + x.alias + ')' : '') + (x.idcard ? ' ' + x.idcard : ''); }).join('\n')],
+      ['ทะเบียนรถ', p.vehicles.map(function (v) { return [v.brand, v.model, v.color, v.plate].filter(Boolean).join(' '); }).join(', ')],
+      ['เบอร์โทร', p.phone], ['บัญชี', p.bank], ['พิกัด', p.location], ['สถานะ', p.status],
+      ['ผู้รายงาน', person(p.rep)], ['หัวหน้าชุด', person(p.com)]
+    ];
+    var list = el('dl', { class: 'bch-list' });
+    rows.forEach(function (r) { list.appendChild(el('dt', { text: r[0] })); list.appendChild(el('dd', { text: r[1] || '—' })); });
+    var go = el('button', { type: 'button', class: 'btn', text: 'เปิดระบบ บช. และเติมข้อมูล' });
+    var cancel = el('button', { type: 'button', class: 'btn ghost', text: 'ปิด' });
+    var kids = [el('h3', { text: 'ข้อมูลที่จะเติมในระบบ บช.ตชด.' })];
+    if (head) kids.push(el('p', { class: 'small', text: head }));
+    kids.push(el('p', { class: 'muted small', text: entry ? 'เฉพาะข้อมูลที่ใหม่ในความคืบหน้านี้ ช่องที่ไม่มีข้อมูลเว้นว่าง ตรวจ แนบไฟล์ แล้วกดบันทึกเองในระบบ บช.' : 'ดึงจากข้อมูลในระบบเรา (ช่องที่ไม่มีข้อมูลเว้นว่าง) ไฟล์/รูปและช่องบรรยายให้แนบ/กรอกเองในระบบ บช. แล้วกดบันทึกเอง' }));
+    kids.push(list, go, cancel);
+    var modal = el('div', { id: 'bch-modal', class: 'bch-modal' }, [el('div', { class: 'panel bch-card' }, kids)]);
+    go.addEventListener('click', function () { sendToExternal(p); modal.remove(); });
+    cancel.addEventListener('click', function () { modal.remove(); });
+    modal.addEventListener('click', function (e) { if (e.target === modal) modal.remove(); });
+    document.body.appendChild(modal);
+  }
+  var pendingBchPayload = null;
+  var bchSync = {};
+  function paintBchSent(btn, st) {
+    var on = !!(st && st.sentAt);
+    btn.dataset.on = on ? '1' : '';
+    btn.textContent = on ? '✓ ส่ง บช. แล้ว (' + String(st.sentAt).slice(0, 10) + ' ' + (st.sentBy || '') + ') · กดเพื่อยกเลิก' : 'ทำเครื่องหมาย ส่ง บช. แล้ว';
+    btn.classList.toggle('on', on);
+  }
+  function loadBchSync(id) {
+    call('getBchSync', [session.token, id]).then(function (m) {
+      if (currentCaseId !== id) return;
+      bchSync = m || {};
+      document.querySelectorAll('[data-bch-sent]').forEach(function (b) { paintBchSent(b, bchSync[b.getAttribute('data-bch-sent')]); });
+      runBchDeepLink(id);
+    }).catch(function () { runBchDeepLink(id); });
+  }
+  function toggleBchSent(eid, btn) {
+    var on = btn.dataset.on !== '1';
+    btn.disabled = true;
+    call('markBchSent', [session.token, eid, on, currentCaseId]).then(function (r) {
+      bchSync[eid] = { sentAt: r.sentAt, sentBy: r.sentBy }; paintBchSent(btn, bchSync[eid]);
+      toast(on ? 'ทำเครื่องหมายส่ง บช. แล้ว' : 'ยกเลิกเครื่องหมายแล้ว');
+    }).catch(function (e) { toast(e.message); }).then(function () { btn.disabled = false; });
+  }
+  // ลิงก์จากแจ้งเตือน LINE: /track/?case=ID&bch=ENTRY|case → เปิดเคสและเปิดหน้าตรวจข้อมูล บช. ให้กดเอง
+  var BCH_DL_KEY = 'u244-bch-dl';
+  try { var q0 = new URLSearchParams(location.search); if (q0.get('case')) { sessionStorage.setItem(BCH_DL_KEY, JSON.stringify({ c: q0.get('case'), b: q0.get('bch') || '' })); history.replaceState(null, '', location.pathname); } } catch (e) {}
+  function takeBchDeepLink() { try { var v = JSON.parse(sessionStorage.getItem(BCH_DL_KEY) || 'null'); return v; } catch (e) { return null; } }
+  function runBchDeepLink(id) {
+    var d = takeBchDeepLink();
+    if (!d || d.c !== id || !currentBundle) return;
+    sessionStorage.removeItem(BCH_DL_KEY);
+    if (!d.b) return;
+    if (d.b === 'case') { openBchPreview(null); return; }
+    var en = (currentBundle.entries || []).filter(function (e) { return e.id === d.b; })[0];
+    if (en) openBchPreview(en); else toast('ไม่พบความคืบหน้านี้ในเคส');
+  }
+  function openBchDeepLinkCase() { var d = takeBchDeepLink(); if (d && d.c) { openCase(d.c); return true; } return false; }
+  function sendToExternal(given) {
+    if (!currentBundle) return;
+    var payload = given || extPayload(currentBundle);
+    var acked = false;
+    var onAck = function (ev) { if (ev.source === window && ev.data && ev.data.type === 'tchd244-ext-ack') { acked = true; window.removeEventListener('message', onAck); } };
+    window.addEventListener('message', onAck);
+    window.postMessage({ type: 'tchd244-ext-payload', payload: payload }, location.origin);
+    var win = window.open(EXT_URL, '_blank', 'noopener');
+    setTimeout(function () {
+      window.removeEventListener('message', onAck);
+      if (acked) { toast('เตรียมข้อมูลแล้ว ในระบบ บช.ตชด. กดปุ่ม "เติมข้อมูลจาก ตชด.244" ตรวจแล้วกดบันทึกเอง'); }
+      else { $('ext-help').hidden = false; }
+    }, 900);
+    return win;
+  }
+
+  function openExtForm() {
+    openForm('ext');
+    extHandle = { fields: buildExtFields($('ext-host'), extFromBundle(currentBundle)), targets: buildExtTargets($('ext-targets-host'), currentBundle.targets) };
+  }
+
+  function openForm(mode) {
+    ['case', 'entry', 'target', 'next', 'ext'].forEach(function (name) {
+      $('form-' + name).hidden = name !== mode;
+    });
+    $('form-error').hidden = true;
+    var titles = {
+      case: 'เพิ่มเคสใหม่',
+      entry: 'เพิ่มความคืบหน้า',
+      target: 'เพิ่มเป้าหมาย',
+      next: 'แก้ขั้นต่อไป',
+      ext: 'ข้อมูลรายงาน บช.ตชด.'
+    };
+    $('form-title').textContent = titles[mode];
+    if (mode === 'case') {
+      $('case-name-input').value = '';
+      $('case-detail-input').value = '';
+      $('case-next-input').value = '';
+      caseExtHandle = buildExtFields($('case-ext-host'), { startDate: todayInput(), extStatus: 'กำลังดำเนินการ', reporter: splitPerson(session && session.user && session.user.name), leader: EXT_LEADER });
+    }
+    if (mode === 'entry') {
+      editingEntryId = null;
+      $('entry-photo-box').hidden = false;
+      $('entry-edit-note').hidden = true;
+      $('entry-submit').textContent = 'บันทึกความคืบหน้า';
+      var s5b = document.querySelector('#stage-picker button[data-stage="5"]');
+      if (s5b && currentBundle) s5b.disabled = !currentBundle.closable;
+      $('entry-date').value = todayInput();
+      $('entry-time').value = '';
+      $('entry-text').value = '';
+      $('entry-phones').value = '';
+      $('entry-plates').value = '';
+      $('entry-people').value = '';
+      $('entry-photos').value = '';
+      $('entry-photo-label').textContent = 'ยังไม่ได้เลือกรูป';
+      $('arrest-url').value = '';
+      selectedStage = 0;
+      paintStages();
+      $('arrest-field').hidden = true;
+    }
+    if (mode === 'target') {
+      ['target-title', 'target-first', 'target-last', 'target-photo', 'target-name', 'target-nickname', 'target-nid', 'target-birth', 'target-address', 'target-phones', 'target-role'].forEach(function (id) {
+        $(id).value = '';
+      });
+      $('target-photo-label').textContent = 'ยังไม่ได้เลือกรูป';
+    }
+    if (mode === 'next') $('next-text').value = currentBundle ? (currentBundle.card.nextStep || '') : '';
+    show('form');
+  }
+
+  function formError(text) {
+    var node = $('form-error');
+    node.hidden = !text;
+    node.textContent = text || '';
+  }
+
+  function paintStages() {
+    document.querySelectorAll('#stage-picker button').forEach(function (btn) {
+      var on = Number(btn.getAttribute('data-stage')) === selectedStage;
+      btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+      btn.classList.toggle('selected', on);
+    });
+  }
+
+  function compressImage(file) {
+    return new Promise(function (resolve, reject) {
+      var img = new Image();
+      var url = URL.createObjectURL(file);
+      img.onload = function () {
+        var max = 1280;
+        var scale = Math.min(1, max / Math.max(img.width, img.height));
+        var canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(img.width * scale));
+        canvas.height = Math.max(1, Math.round(img.height * scale));
+        canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+        URL.revokeObjectURL(url);
+        var dataUrl = canvas.toDataURL('image/jpeg', 0.72);
+        resolve({
+          name: String(file.name || 'photo').replace(/\.\w+$/, '') + '.jpg',
+          mime: 'image/jpeg',
+          base64: dataUrl.split(',')[1]
+        });
+      };
+      img.onerror = function () {
+        URL.revokeObjectURL(url);
+        reject(new Error('อ่านรูปไม่สำเร็จ'));
+      };
+      img.src = url;
+    });
+  }
+
+  function readFiles(fileList, limit) {
+    var files = Array.prototype.slice.call(fileList || []).slice(0, limit || 1);
+    return Promise.all(files.map(compressImage));
+  }
+
+  function saveFile(file) {
+    var binary = atob(file.base64);
+    var bytes = new Uint8Array(binary.length);
+    var i;
+    for (i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    var blob = new Blob([bytes], { type: file.mime || 'application/pdf' });
+    var url = URL.createObjectURL(blob);
+    var anchor = el('a', { href: url, download: file.filename || 'download.pdf' });
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1500);
+  }
+
+  $('login-form').addEventListener('change', function (event) {
+    if (!event.target || event.target.id !== 'user-id') return;
+    $('custom-name-field').hidden = event.target.value !== '__other__';
+  });
+  $('login-form').addEventListener('submit', function (event) {
+    event.preventDefault();
+    var userId = $('user-id').value;
+    var password = $('password').value;
+    var customName = $('custom-name').value;
+    showLoginError('');
+    if (!password) {
+      showLoginError('ใส่รหัสหน่วย');
+      return;
+    }
+    if (!userId) {
+      showLoginError('เลือกชื่อ');
+      return;
+    }
+    if (userId === '__other__' && !customName.trim()) {
+      showLoginError('กรอกชื่อ');
+      return;
+    }
+    $('login-btn').disabled = true;
+    call('login', [userId, password, customName]).then(function (res) {
+      session = { token: res.token, user: res.user };
+      sessionStorage.setItem(SESSION_KEY, JSON.stringify(session));
+      $('password').value = '';
+      applyRole();
+      show('home');
+      if (openBchDeepLinkCase()) return;
+      var cc1 = null; try { cc1 = sessionStorage.getItem('trk_cur_case'); } catch (e) {}
+      var started = loadHome(false);
+      if (cc1) openCase(cc1);
+      return started;
+    }).catch(function (err) {
+      showLoginError(err.message);
+    }).then(function () {
+      $('login-btn').disabled = false;
+    });
+  });
+
+  $('logout').addEventListener('click', function () { logout(false); show('login'); });
+  $('show-closed').addEventListener('change', function () { loadHome(false); });
+  $('btn-new').addEventListener('click', function () { openForm('case'); });
+  function goHomeList() { try { sessionStorage.removeItem('trk_cur_case'); } catch (e) {} var lb = $('lightbox'); if (lb) { lb.hidden = true; lb.style.display = 'none'; } show('home'); loadHome(true); }
+  // ปุ่มย้อนกลับของโทรศัพท์/เบราว์เซอร์: จากหน้าเคส -> รายการเคส, จากรายการเคส -> อยู่ในแอป (กันหลุดไปหน้าแรกพอร์ทัล)
+  try {
+    if (!(history.state && history.state.trk)) { history.replaceState({ trk: 'root' }, ''); history.pushState({ trk: 'home' }, ''); }
+    window.addEventListener('popstate', function (ev) {
+      var st = ev.state || {};
+      var lb = $('lightbox'); if (lb && !lb.hidden) { lb.hidden = true; lb.style.display = 'none'; }
+      if (st.trk === 'case' && st.id && session) { openCase(st.id, true); return; }
+      if (st.trk === 'root') { history.pushState({ trk: 'home' }, ''); }
+      if (currentView === 'case' || currentView === 'form') goHomeList();
+    });
+  } catch (e) {}
+  $('btn-back').addEventListener('click', function () { if (history.state && history.state.trk === 'case') history.back(); else goHomeList(); });
+  $('form-back').addEventListener('click', function () {
+    if (!$('form-case').hidden || !currentCaseId) show('home');
+    else show('case');
+  });
+  $('btn-add-entry').addEventListener('click', function () { openForm('entry'); });
+  $('btn-add-target').addEventListener('click', function () { openForm('target'); });
+  (function () {
+    var board = $('case-board');
+    if (!board) return;
+    var startX = 0;
+    var startY = 0;
+    var active = false;
+    board.addEventListener('pointerdown', function (event) {
+      if (event.button && event.button !== 0) return;
+      if (event.target.closest('button, a, input, textarea, select, label')) return;
+      startX = event.clientX;
+      startY = event.clientY;
+      active = true;
+    });
+    function finish(event) {
+      if (!active) return;
+      active = false;
+      var dx = event.clientX - startX;
+      var dy = event.clientY - startY;
+      if (Math.abs(dx) < 50 || Math.abs(dx) <= Math.abs(dy)) return;
+      setTargetsOpen(dx < 0);
+    }
+    board.addEventListener('pointerup', finish);
+    board.addEventListener('pointercancel', function () { active = false; });
+  })();
+  $('btn-edit-next').addEventListener('click', function () { openForm('next'); });
+  $('pick-entry-photos').addEventListener('click', function () { $('entry-photos').click(); });
+  $('entry-photos').addEventListener('change', function () {
+    var count = $('entry-photos').files.length;
+    $('entry-photo-label').textContent = count ? ('เลือกแล้ว ' + count + ' รูป') : 'ยังไม่ได้เลือกรูป';
+  });
+  $('pick-target-photo').addEventListener('click', function () { $('target-photo').click(); });
+  $('target-photo').addEventListener('change', function () {
+    var file = $('target-photo').files[0];
+    $('target-photo-label').textContent = file ? file.name : 'ยังไม่ได้เลือกรูป';
+  });
+  $('stage-picker').addEventListener('click', function (event) {
+    var btn = event.target.closest('button');
+    if (!btn) return;
+    selectedStage = Number(btn.getAttribute('data-stage'));
+    paintStages();
+    $('arrest-field').hidden = selectedStage !== 5;
+  });
+
+  $('form-case').addEventListener('submit', function (event) {
+    event.preventDefault();
+    formError('');
+    var name = $('case-name-input').value.trim();
+    if (!name) { formError('กรอกชื่อเคส'); return; }
+    call('createCase', [session.token, {
+      name: name,
+      detail: $('case-detail-input').value,
+      nextStep: $('case-next-input').value,
+      ext: caseExtHandle ? caseExtHandle.value() : null
+    }]).then(function () {
+      toast('บันทึกเคสแล้ว');
+      show('home');
+      return loadHome(false);
+    }).catch(function (err) { formError(err.message); });
+  });
+
+  $('form-entry').addEventListener('submit', function (event) {
+    event.preventDefault();
+    formError('');
+    if (!selectedStage) { formError('เลือกขั้นของความคืบหน้า'); return; }
+    if (!$('entry-text').value.trim()) { formError('กรอกความคืบหน้า'); return; }
+    var button = event.target.querySelector('button[type="submit"]');
+    button.disabled = true;
+    if (editingEntryId) {
+      call('updateEntry', [session.token, currentCaseId, editingEntryId, {
+        entryDate: $('entry-date').value,
+        eventTime: $('entry-time').value,
+        text: $('entry-text').value,
+        stage: selectedStage,
+        phones: $('entry-phones').value,
+        plates: $('entry-plates').value,
+        people: $('entry-people').value
+      }]).then(function () {
+        editingEntryId = null;
+        toast('บันทึกการแก้ไขแล้ว');
+        openCase(currentCaseId); refreshFilesInBackground(currentCaseId);
+      }).catch(function (err) { formError(err.message); })
+        .then(function () { button.disabled = false; });
+      return;
+    }
+    readFiles($('entry-photos').files, 4).then(function (photos) {
+      return call('addEntry', [session.token, currentCaseId, {
+        entryDate: $('entry-date').value,
+        eventTime: $('entry-time').value,
+        text: $('entry-text').value,
+        stage: selectedStage,
+        phones: $('entry-phones').value,
+        plates: $('entry-plates').value,
+        people: $('entry-people').value,
+        arrestRecordUrl: $('arrest-url').value,
+        photos: photos
+      }]);
+    }).then(function (res) {
+      toast(res && res.closed ? 'บันทึกแล้ว และปิดเคส' : 'บันทึกความคืบหน้าแล้ว');
+      openCase(currentCaseId); refreshFilesInBackground(currentCaseId);
+    }).catch(function (err) { formError(err.message); })
+      .then(function () { button.disabled = false; });
+  });
+
+  $('form-target').addEventListener('submit', function (event) {
+    event.preventDefault();
+    formError('');
+    var tExt = { title: $('target-title').value, firstName: $('target-first').value.trim(), lastName: $('target-last').value.trim() };
+    if (!$('target-name').value.trim()) {
+      var composed = ((tExt.title && tExt.title !== 'ไม่ทราบ' ? tExt.title : '') + tExt.firstName + (tExt.lastName ? ' ' + tExt.lastName : '')).trim();
+      if (composed) $('target-name').value = composed;
+    }
+    if (!$('target-name').value.trim()) { formError('กรอกชื่อเป้าหมาย'); return; }
+    var button = event.target.querySelector('button[type="submit"]');
+    button.disabled = true;
+    var files = $('target-photo').files;
+    var pending = files && files.length ? readFiles(files, 1) : Promise.resolve([]);
+    pending.then(function (photos) {
+      return call('addTarget', [session.token, currentCaseId, {
+        name: $('target-name').value,
+        nickname: $('target-nickname').value,
+        nationalId: $('target-nid').value,
+        birthDate: $('target-birth').value,
+        address: $('target-address').value,
+        phones: $('target-phones').value,
+        roleNotes: $('target-role').value,
+        ext: (tExt.title || tExt.firstName || tExt.lastName) ? tExt : null,
+        photo: photos[0] || null
+      }]);
+    }).then(function () {
+      toast('บันทึกเป้าหมายแล้ว');
+      openCase(currentCaseId); refreshFilesInBackground(currentCaseId);
+    }).catch(function (err) { formError(err.message); })
+      .then(function () { button.disabled = false; });
+  });
+
+  $('btn-edit-ext').addEventListener('click', function () { if (currentBundle) openExtForm(); });
+  $('btn-send-ext').addEventListener('click', function () { openBchPreview(); });
+  $('form-ext').addEventListener('submit', function (event) {
+    event.preventDefault();
+    formError('');
+    if (!extHandle) return;
+    var button = event.target.querySelector('button[type="submit"]');
+    button.disabled = true;
+    var caseId = currentCaseId;
+    var tRows = extHandle.targets.value().filter(function (r) { return JSON.stringify(r.ext) !== r.orig && (r.ext.title || r.ext.firstName || r.ext.lastName || r.orig !== '{}'); });
+    call('updateCaseExt', [session.token, caseId, extHandle.fields.value()]).then(function () {
+      return tRows.reduce(function (p, r) { return p.then(function () { return call('updateTargetExt', [session.token, r.id, r.ext]); }); }, Promise.resolve());
+    }).then(function () {
+      toast('บันทึกข้อมูลรายงานแล้ว');
+      openCase(caseId);
+    }).catch(function (err) { formError(err.message); })
+      .then(function () { button.disabled = false; });
+  });
+
+  $('form-next').addEventListener('submit', function (event) {
+    event.preventDefault();
+    call('updateNextStep', [session.token, currentCaseId, $('next-text').value]).then(function () {
+      toast('บันทึกขั้นต่อไปแล้ว');
+      openCase(currentCaseId); refreshFilesInBackground(currentCaseId);
+    }).catch(function (err) { formError(err.message); });
+  });
+
+  $('btn-save-arrest').addEventListener('click', function () {
+    call('updateArrestLink', [session.token, currentCaseId, $('case-arrest-url').value]).then(function () {
+      toast('บันทึกลิงก์แล้ว');
+      openCase(currentCaseId);
+    }).catch(function (err) { toast(err.message); });
+  });
+
+  var dlBusy = false;
+  var dlUrl = null;
+  var DL_BUTTONS = ['btn-summary', 'btn-case-pdf', 'btn-case-slide', 'btn-case-memo'];
+
+  function dlPanel(state, text) {
+    var panel = $('dl-panel');
+    panel.hidden = false;
+    panel.className = state === 'error' ? 'error' : '';
+    if (state !== 'done') { var dll = $('dl-list'); if (dll) dll.remove(); }
+    $('dl-text').textContent = text;
+    $('dl-link').hidden = state !== 'done';
+    $('dl-close').hidden = state === 'busy';
+  }
+
+  function setDlButtons(disabled) {
+    DL_BUTTONS.forEach(function (id) { var b = $(id); if (b) b.disabled = disabled; });
+  }
+
+  function download(method, args, pendingText) {
+    if (dlBusy) { dlPanel('busy', 'กำลังสร้างไฟล์ก่อนหน้าอยู่ กรุณารอสักครู่…'); return; }
+    if (method === 'downloadCasePdf' && !args[1]) { dlPanel('error', 'ยังไม่ได้เลือกคดี กรุณาเปิดคดีก่อน'); return; }
+    dlBusy = true;
+    setDlButtons(true);
+    var started = Date.now();
+    dlPanel('busy', pendingText + ' (อาจใช้เวลา 20–60 วินาที)');
+    var timer = setInterval(function () {
+      if (!dlBusy) return;
+      $('dl-text').textContent = pendingText + ' ' + Math.round((Date.now() - started) / 1000) + ' วินาที';
+    }, 1000);
+    call(method, args).then(function (file) {
+      if (!file || !file.base64) throw new Error('เซิร์ฟเวอร์ไม่ส่งไฟล์กลับมา กรุณาลองใหม่');
+      if (dlUrl) { try { URL.revokeObjectURL(dlUrl); } catch (e) { /* ignore */ } }
+      var binary = atob(file.base64);
+      var bytes = new Uint8Array(binary.length);
+      for (var i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+      var blob = new Blob([bytes], { type: file.mime || 'application/pdf' });
+      if (args[2] === 'slide' && /pdf/.test(file.mime || '')) {
+        return pdfToPng(bytes).then(function (png) {
+          finishDl(png, String(file.filename || 'โปสเตอร์.pdf').replace(/\.pdf$/i, '.png'));
+        }, function () { finishDl(blob, file.filename); });
+      }
+      finishDl(blob, file.filename);
+    }).catch(function (err) {
+      dlPanel('error', 'สร้างไฟล์ไม่สำเร็จ: ' + (err && err.message ? err.message : 'เกิดข้อผิดพลาด'));
+    }).then(function () {
+      clearInterval(timer);
+      dlBusy = false;
+      setDlButtons(false);
+    });
+  }
+
+  // โปสเตอร์: แปลง PDF หน้าเดียวเป็นภาพ PNG ในเบราว์เซอร์ (pdf.js, ไม่ใช้ AI/โทเคน)
+  var pdfjsReady = null;
+  function loadPdfJs() {
+    if (pdfjsReady) return pdfjsReady;
+    pdfjsReady = new Promise(function (ok, no) {
+      var sc = document.createElement('script');
+      sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+      sc.onload = function () {
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+        ok(window.pdfjsLib);
+      };
+      sc.onerror = function () { pdfjsReady = null; no(new Error('pdfjs')); };
+      document.head.appendChild(sc);
+    });
+    return pdfjsReady;
+  }
+  function pdfToPng(bytes) {
+    return loadPdfJs().then(function (lib) { return lib.getDocument({ data: bytes }).promise; })
+      .then(function (pdf) { return pdf.getPage(1); })
+      .then(function (page) {
+        var vp = page.getViewport({ scale: 1920 / page.getViewport({ scale: 1 }).width });
+        var cv = document.createElement('canvas');
+        cv.width = Math.round(vp.width); cv.height = Math.round(vp.height);
+        return page.render({ canvasContext: cv.getContext('2d'), viewport: vp }).promise.then(function () {
+          return new Promise(function (ok, no) { cv.toBlob(function (b) { b ? ok(b) : no(new Error('png')); }, 'image/png'); });
+        });
+      });
+  }
+
+  // โปสเตอร์แบบ 1 นีออน: ใช้ไฟล์เดิมถ้าข้อมูลไม่เปลี่ยน ไม่งั้นวาดใหม่ในเบราว์เซอร์แล้วเก็บทับไฟล์เดิมใน Drive
+  function posterDownload() {
+    if (dlBusy) { dlPanel('busy', 'กำลังสร้างไฟล์ก่อนหน้าอยู่ กรุณารอสักครู่…'); return; }
+    if (!currentCaseId) { dlPanel('error', 'ยังไม่ได้เลือกคดี กรุณาเปิดคดีก่อน'); return; }
+    dlBusy = true; setDlButtons(true);
+    var started = Date.now(), txt = 'กำลังเตรียมโปสเตอร์ล่าสุด…';
+    dlPanel('busy', txt);
+    var timer = setInterval(function () { if (dlBusy) $('dl-text').textContent = txt + ' ' + Math.round((Date.now() - started) / 1000) + ' วินาที'; }, 1000);
+    var caseId = currentCaseId;
+    call('getPosterData', [session.token, caseId]).then(function (r) {
+      if (!r) throw new Error('เซิร์ฟเวอร์ไม่ส่งข้อมูลกลับมา');
+      if (r.cached) { finishDl(new Blob([b64ToBytes(r.base64)], { type: 'image/png' }), r.filename); return; }
+      return Poster.render(r.data).then(function (png) {
+        finishDl(png, r.filename);
+        return png.arrayBuffer().then(function (buf) {
+          return call('savePosterPng', [session.token, caseId, bytesToB64(new Uint8Array(buf)), r.hash]).catch(function (e) { console.log('savePoster ' + e); });
+        });
+      });
+    }).catch(function (err) {
+      dlPanel('error', 'สร้างโปสเตอร์ไม่สำเร็จ: ' + (err && err.message ? err.message : 'เกิดข้อผิดพลาด'));
+    }).then(function () { clearInterval(timer); dlBusy = false; setDlButtons(false); });
+  }
+  // บันทึกสืบหลายไฟล์: แสดงรายการ แตะทีละไฟล์ (ดาวน์โหลด / เปิดใน Drive) ใช้ได้บน iPhone
+  function finishDlList(files) {
+    var p = $('dl-panel'), old = $('dl-list'); if (old) old.remove();
+    var box = el('div', { id: 'dl-list' });
+    files.forEach(function (f) {
+      var row = el('div', { class: 'dl-row' });
+      var a = el('a', { class: 'btn small', text: '⬇ ' + f.filename });
+      if (f.base64) { a.href = URL.createObjectURL(new Blob([b64ToBytes(f.base64)], { type: f.mime })); a.setAttribute('download', f.filename); } else { a.href = f.url; a.target = '_blank'; }
+      row.appendChild(a); row.appendChild(document.createTextNode(' '));
+      row.appendChild(el('a', { href: f.url, target: '_blank', rel: 'noopener', text: 'เปิดใน Drive' }));
+      box.appendChild(row);
+    });
+    dlPanel('done', 'บันทึกสืบ ' + files.length + ' ไฟล์ (แยกรายครั้ง + PDF รวม) — แตะทีละไฟล์');
+    $('dl-link').hidden = true;
+    p.insertBefore(box, p.querySelector('.dl-actions'));
+  }
+  function finishDl(blob, filename) {
+      filename = filename || 'download.pdf';
+      dlUrl = URL.createObjectURL(blob);
+      var link = $('dl-link');
+      link.href = dlUrl;
+      link.setAttribute('download', filename);
+      link.removeAttribute('target');
+      dlPanel('done', 'สร้างไฟล์เสร็จแล้ว: ' + filename + ' — ถ้าไฟล์ไม่ดาวน์โหลดเอง แตะปุ่มด้านล่าง');
+      try { link.click(); } catch (e) { /* ให้ผู้ใช้แตะเอง */ }
+  }
+
+
+  // ===== ดาวน์โหลดสรุปรวม (รวม PDF ของหลายคดี ในเบราว์เซอร์ ไม่ใช้ AI) =====
+  var pdfLibReady = null;
+  function loadPdfLib() {
+    if (pdfLibReady) return pdfLibReady;
+    pdfLibReady = new Promise(function (ok, no) {
+      var sc = document.createElement('script');
+      sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js';
+      sc.onload = function () { ok(window.PDFLib); };
+      sc.onerror = function () { pdfLibReady = null; no(new Error('โหลดตัวรวม PDF ไม่ได้ (ต้องต่ออินเทอร์เน็ต)')); };
+      document.head.appendChild(sc);
+    });
+    return pdfLibReady;
+  }
+  function b64ToBytes(b64) { var bin = atob(b64); var u = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i += 1) u[i] = bin.charCodeAt(i); return u; }
+  function bytesToB64(u) { var s = ''; for (var i = 0; i < u.length; i += 32768) s += String.fromCharCode.apply(null, u.subarray(i, i + 32768)); return btoa(s); }
+  function comboLoad() {
+    $('combo-list').innerHTML = '<p class="muted">กำลังโหลดรายชื่อคดี…</p>';
+    return call('listCases', [session.token, $('combo-closed').checked]).then(function (res) {
+      var cards = (res && res.cards) || [];
+      var box = $('combo-list'); box.innerHTML = '';
+      if (!cards.length) { box.innerHTML = '<p class="muted">ไม่มีคดี</p>'; return; }
+      cards.forEach(function (c) {
+        var l = document.createElement('label'); l.className = 'toggle'; l.style.cssText = 'display:flex;gap:8px;align-items:center;margin:4px 0';
+        var cb = document.createElement('input'); cb.type = 'checkbox'; cb.value = c.id; cb.className = 'combo-cb'; cb.checked = $('combo-all').checked;
+        l.appendChild(cb); l.appendChild(document.createTextNode(' ' + c.name + (c.status === 'closed' ? ' (ปิดแล้ว)' : '')));
+        box.appendChild(l);
+      });
+    }).catch(function (err) { $('combo-list').innerHTML = ''; $('combo-status').textContent = err.message; });
+  }
+  $('btn-combined').addEventListener('click', function () { var b = $('combo-box'); b.hidden = !b.hidden; if (!b.hidden) { $('combo-status').textContent = ''; comboLoad(); } });
+  $('combo-cancel').addEventListener('click', function () { $('combo-box').hidden = true; });
+  $('combo-closed').addEventListener('change', comboLoad);
+  $('combo-all').addEventListener('change', function () { Array.prototype.forEach.call(document.querySelectorAll('.combo-cb'), function (x) { x.checked = $('combo-all').checked; }); });
+  $('combo-go').addEventListener('click', function () {
+    if (dlBusy) { $('combo-status').textContent = 'กำลังสร้างไฟล์อื่นอยู่ กรุณารอสักครู่'; return; }
+    var ids = Array.prototype.filter.call(document.querySelectorAll('.combo-cb'), function (x) { return x.checked; }).map(function (x) { return x.value; });
+    if (!ids.length) { $('combo-status').textContent = 'กรุณาเลือกอย่างน้อย 1 คดี'; return; }
+    dlBusy = true; setDlButtons(true); $('combo-go').disabled = true;
+    var st = function (t) { $('combo-status').textContent = t; dlPanel('busy', t); };
+    var parts = [];
+    var chain = loadPdfLib();
+    ids.forEach(function (id, i) {
+      chain = chain.then(function () {
+        st('กำลังเตรียม PDF คดีที่ ' + (i + 1) + '/' + ids.length + '… (คดีที่ข้อมูลไม่เปลี่ยนจะใช้ไฟล์เดิม)');
+        return call('downloadCaseFile', [session.token, id, 'report']).then(function (f) { parts.push(b64ToBytes(f.base64)); });
+      });
+    });
+    chain.then(function () {
+      st('กำลังรวมไฟล์…');
+      var L = window.PDFLib;
+      return L.PDFDocument.create().then(function (out) {
+        var c2 = Promise.resolve();
+        parts.forEach(function (bytes) {
+          c2 = c2.then(function () { return L.PDFDocument.load(bytes); }).then(function (src) {
+            return out.copyPages(src, src.getPageIndices()).then(function (pages) { pages.forEach(function (p) { out.addPage(p); }); });
+          });
+        });
+        return c2.then(function () { return out.save(); });
+      });
+    }).then(function (merged) {
+      st('กำลังบันทึกลง Drive…');
+      return call('saveCombinedPdf', [session.token, bytesToB64(merged), ids]).then(function (r) {
+        finishDl(new Blob([merged], { type: 'application/pdf' }), r.name);
+        $('combo-status').innerHTML = '';
+        var a = document.createElement('a'); a.href = r.url; a.target = '_blank'; a.rel = 'noopener'; a.textContent = 'เปิดไฟล์สรุปรวมใน Drive (' + ids.length + ' คดี)';
+        $('combo-status').appendChild(a);
+        try { window.open(r.url, '_blank'); } catch (e) { /* ใช้ลิงก์แทน */ }
+      });
+    }).catch(function (err) {
+      st('สร้างสรุปรวมไม่สำเร็จ: ' + (err && err.message ? err.message : 'เกิดข้อผิดพลาด')); dlPanel('error', $('combo-status').textContent);
+    }).then(function () { dlBusy = false; setDlButtons(false); $('combo-go').disabled = false; });
+  });
+  $('dl-close').addEventListener('click', function () { $('dl-panel').hidden = true; });
+
+  $('btn-summary').addEventListener('click', function () {
+    download('downloadSummaryPdf', [session.token], 'กำลังสร้างสรุปรวม…');
+  });
+
+  // ===== ดาวน์โหลดจากข้อมูลที่เก็บแล้ว ไม่ดึงซ้ำ =====
+  function escH(t) { return String(t == null ? '' : t).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+  var BCH_LABELS = [['caseId', 'รหัสคดี'], ['status', 'สถานะ'], ['startDate', 'วันที่เริ่ม'], ['casePast', 'อดีต'], ['casePresent', 'ปัจจุบัน'], ['caseFuture', 'อนาคต (แผน)'], ['caseResult', 'ผล'], ['caseObstacle', 'อุปสรรค'], ['caseNeed', 'สิ่งที่ต้องการ'], ['relatedCase', 'คดีที่เกี่ยวข้อง']];
+  function bchUpd(id, msg) { var u = $('bch-upd'); if (u && currentCaseId === id) u.textContent = msg; }
+  function loadBchData(id, autoSync) {
+    var box = $('bch-data'); if (!box) return;
+    box.innerHTML = '<p class="muted">กำลังโหลดข้อมูล บช.…</p>';
+    call('getBchData', [session.token, id]).then(function (r) {
+      if (currentCaseId !== id) return;
+      var upd = '<p class="muted" id="bch-upd"></p>';
+      if (!r) { box.innerHTML = upd + '<p class="muted">ยังไม่มีข้อมูลที่ดึงจาก บช.</p>'; return; }
+      var F = r.snap.fields || {}, P = r.snap.photos || {};
+      var tg = [F.intelFName, F.intelLName].filter(function (x) { return x && x !== '-'; }).join(' ');
+      var rows = BCH_LABELS.map(function (k) { var v = F[k[0]]; return v && v !== '-' ? '<dt>' + k[1] + '</dt><dd>' + escH(v) + '</dd>' : ''; }).join('') + (tg ? '<dt>เป้าหมาย</dt><dd>' + escH(tg) + (F.intelPhone && F.intelPhone !== '-' ? ' โทร ' + escH(F.intelPhone) : '') + '</dd>' : '');
+      var ph = Object.keys(P).map(function (t) { return '<a target="_blank" rel="noopener" href="https://drive.google.com/file/d/' + encodeURIComponent(P[t]) + '/view">รูป ' + escH(t) + '</a>'; }).join(' · ');
+      var hs = (r.history || []).map(function (h) { return '<li>' + escH(String(h.at).replace('T', ' ').slice(0, 16)) + ' (บช. อัปเดต ' + escH(h.updated) + ')' + (h.newFiles ? ' รูปใหม่: ' + escH(h.newFiles) : '') + '</li>'; }).join('');
+      box.innerHTML = upd + '<p class="muted">ดึงล่าสุด ' + escH(String(r.pulledAt).replace('T', ' ').slice(0, 16)) + ' น. · บช. อัปเดต ' + escH(r.snap.updated || '-') + '</p><dl>' + rows + '</dl>' + (ph ? '<div class="ph">' + ph + '</div>' : '') + (hs ? '<details><summary>ประวัติการดึงที่ข้อมูลเปลี่ยน</summary><ul>' + hs + '</ul></details>' : '');
+    }).catch(function (e) { if (currentCaseId === id) box.textContent = 'โหลดข้อมูล บช. ไม่สำเร็จ: ' + (e && e.message); });
+  }
+  function renderCaseOutputs(files) {
+    var box = $('case-outputs');
+    if (!box) return;
+    clear(box);
+    if (!files || !files.length) {
+      box.appendChild(el('p', { class: 'muted small', text: 'ยังไม่มีไฟล์ที่บันทึกไว้' }));
+      return;
+    }
+    files.forEach(function (f) {
+      var row = el('div', { class: 'dl-row' });
+      var name = f.filename || 'ไฟล์';
+      row.appendChild(el('a', { href: f.downloadUrl || f.url, target: '_blank', rel: 'noopener', text: 'ดาวน์โหลด ' + name }));
+      row.appendChild(document.createTextNode(' · '));
+      row.appendChild(el('a', { href: f.url, target: '_blank', rel: 'noopener', text: 'เปิดใน Drive' }));
+      box.appendChild(row);
+    });
+  }
+  function loadCaseOutputs(id) {
+    call('getCaseOutputFiles', [session.token, id]).then(function (r) {
+      if (currentCaseId === id) renderCaseOutputs((r && r.files) || []);
+    }).catch(function () { if (currentCaseId === id) renderCaseOutputs([]); });
+  }
+  function bchWaitUpdate(reqId, until) {
+    return new Promise(function (ok, no) {
+      (function tick() {
+        call('bchUpdateStatus', [session.token, reqId]).then(function (s) {
+          if (s.done) return s.ok ? ok(s) : no(new Error(s.err || 'อัปเดตไม่สำเร็จ'));
+          if (Date.now() > until) return no(new Error('เครื่องดึงข้อมูลไม่ตอบ (เกิน 3 นาที)'));
+          setTimeout(tick, 1500);
+        }).catch(no);
+      })();
+    });
+  }
+  var updateBusy = false;
+  function updateCaseData() {
+    if (updateBusy || !currentCaseId || !session) return;
+    var id = currentCaseId;
+    var btn = $('btn-update-data');
+    var status = $('update-status');
+    updateBusy = true;
+    if (btn) btn.disabled = true;
+    var started = Date.now();
+    if (status) status.textContent = 'กำลังดึงข้อมูล บช. ล่าสุด 1 ครั้ง แล้วสร้างไฟล์…';
+    var timer = setInterval(function () {
+      if (status && updateBusy && currentCaseId === id) status.textContent = 'กำลังดึงข้อมูล บช. ล่าสุด 1 ครั้ง แล้วสร้างไฟล์… ' + Math.round((Date.now() - started) / 1000) + ' วินาที';
+    }, 1000);
+    call('bchRequestUpdate', [session.token, id]).then(function (job) {
+      if (!job || !job.reqId) throw new Error('ส่งคำขอไม่สำเร็จ');
+      return bchWaitUpdate(job.reqId, Date.now() + 180000);
+    }).then(function () {
+      return call('getCaseOutputFiles', [session.token, id]);
+    }).then(function (r) {
+      if (currentCaseId !== id) return;
+      renderCaseOutputs((r && r.files) || []);
+      if (status) status.textContent = 'อัปเดตแล้ว';
+      loadBchData(id, false);
+    }).catch(function (err) {
+      if (currentCaseId === id && status) status.textContent = 'อัปเดตไม่สำเร็จ: ' + (err && err.message ? err.message : 'เกิดข้อผิดพลาด');
+      if (currentCaseId === id) loadCaseOutputs(id);
+    }).then(function () {
+      clearInterval(timer);
+      updateBusy = false;
+      if (btn) btn.disabled = false;
+    });
+  }
+
+  var updateBtn = $('btn-update-data');
+  if (updateBtn) updateBtn.addEventListener('click', updateCaseData);
+  // แก้ไข/เพิ่มข้อมูลทำที่ระบบ บช. เท่านั้น (เปิดหน้าเว็บในแท็บใหม่ ไม่ส่งข้อมูลใดๆ)
+  document.addEventListener('click', function (ev) {
+    var t = ev.target; if (!t || t.tagName !== 'IMG' || t.id === 'lb-img' || !t.src || t.closest('header')) return;
+    ev.preventDefault(); ev.stopPropagation();
+    $('lb-img').src = t.src; var d = $('lb-dl'); d.href = t.src; d.setAttribute('download', 'photo-' + Date.now() + (/png/.test(t.src.slice(0, 30)) ? '.png' : '.jpg')); $('lightbox').hidden = false; $('lightbox').style.display = '';
+  }, true);
+  function lbClose() { var l = $('lightbox'); l.hidden = true; l.style.display = 'none'; $('lb-img').removeAttribute('src'); }
+  document.addEventListener('click', function (ev) { var t = ev.target; if (t && (t.id === 'lb-close' || t.id === 'lightbox')) { ev.preventDefault(); lbClose(); } }, true);
+  document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') lbClose(); });
+  $('btn-bch-upload').addEventListener('click', function () { window.open(EXT_URL, '_blank', 'noopener'); });
+
+  var filesReq = 0;
+  var refreshing = {};
+  function showFilesStatus(id, info, note) {
+    if (currentCaseId !== id) return;
+    if (!note && refreshing[id]) note = 'กำลังอัปเดตไฟล์เบื้องหลัง… ใช้งานต่อได้เลย';
+    var t;
+    if (note) t = note;
+    else if (!info) t = '';
+    else if (info.busy) t = 'กำลังอัปเดตไฟล์เบื้องหลัง…' + (info.updatedText ? ' (ไฟล์ล่าสุด ' + info.updatedText + ')' : '');
+    else if (info.updatedText) t = 'ไฟล์อัปเดตล่าสุด ' + info.updatedText + (info.dirty ? ' · มีข้อมูลใหม่ ระบบจะอัปเดตเมื่อกดดาวน์โหลด' : '');
+    else t = 'ยังไม่มีไฟล์ ระบบจะสร้างให้เมื่อกดดาวน์โหลดครั้งแรก';
+    $('case-files-status').textContent = t;
+  }
+  function loadFilesStatus(id) {
+    var req = ++filesReq;
+    call('getCaseFiles', [session.token, id]).then(function (info) {
+      if (req === filesReq) showFilesStatus(id, info);
+    }).catch(function () { showFilesStatus(id, null, ''); });
+  }
+  // หลังบันทึกข้อมูล: อัปเดตสไลด์/PDF/บันทึกสืบของเคสเบื้องหลัง ผู้ใช้ไม่ต้องรอ
+  function refreshFilesInBackground(id) {
+    if (!id || !session) return;
+    refreshing[id] = true;
+    showFilesStatus(id, null, 'กำลังอัปเดตไฟล์เบื้องหลัง… ใช้งานต่อได้เลย');
+    call('refreshCaseFiles', [session.token, id]).then(function () {
+      refreshing[id] = false;
+      loadFilesStatus(id);
+    }).catch(function (err) {
+      refreshing[id] = false;
+      showFilesStatus(id, null, 'อัปเดตไฟล์ไม่สำเร็จ (' + err.message + ') ระบบจะลองใหม่เมื่อกดดาวน์โหลด');
+    });
+  }
+
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape' && currentView === 'form') $('form-back').click();
+  });
+
+  setInterval(function () {
+    if (!session || currentView !== 'home') return;
+    loadHome(true);
+  }, 60000);
+
+  try {
+    session = JSON.parse(sessionStorage.getItem(SESSION_KEY) || 'null');
+  } catch (err) {
+    session = null;
+  }
+  if (session && session.token && session.user) {
+    applyRole();
+    show('home');
+    var cc0 = null; try { cc0 = sessionStorage.getItem('trk_cur_case'); } catch (e) {}
+    if (!openBchDeepLinkCase()) { loadHome(false); if (cc0) openCase(cc0); }
+  } else {
+    session = null;
+    show('login');
+  }
+})();
+</script>
