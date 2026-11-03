@@ -163,9 +163,42 @@ def test_memos_group_by_day_even_when_split():
     package = zipfile.ZipFile(io.BytesIO(render.build_suep_docx(bundle, groups[0][1], 1)))
     xml = package.read('word/document.xml').decode('utf-8')
     assert 'เช้า' in xml and 'ค่ำ' in xml and 'บ่าย' not in xml
+    assert 'TH Sarabun New' in xml
+    assert 'w:left="1701"' in xml
+    assert 'ตชด.244 (ชปข.)/.............' in xml and 'C00000' in xml
+    assert '2 มกราคม 2569' in xml
+    assert 'บันทึกข้อความ' in xml and 'จึงเรียนมาเพื่อโปรดทราบ' in xml
     source = open(os.path.join(ROOT, 'render.py'), encoding='utf-8').read()
     assert 'single=True' in source
     assert 'group_by_day' in source
+
+
+def test_memo_uses_known_fields_and_red_gaps():
+    tiny = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+    bundle = {
+        'caseName': 'คดียาบ้า 162,000 เม็ด',
+        'photos': {'entries': {'e1': ['data:image/png;base64,' + tiny]}, 'targets': {}, 'bch': {}},
+        'local': {'entries': [{
+            'id': 'e1', 'entryDate': '2026-10-27', 'eventTime': '', 'text': 'ตรวจจุดต้นทาง',
+            'stage': '2', 'stageLabel': 'พิสูจน์ทราบตัวบุคคล', 'people': 'นายทดสอบ',
+            'phones': '', 'plates': '', 'authorName': 'จ.ส.ต.อัจฉะริยะ จักรเรืองชัย',
+            'createdAt': '2026-11-02T20:13:00+07:00', 'photoFiles': ['2026-10-27_ขั้น2_เล่ชาญชัย_1.jpg'],
+        }]},
+        'snap': {'fields': {}},
+    }
+    notes = render.events(bundle)
+    package = zipfile.ZipFile(io.BytesIO(render.build_suep_docx(bundle, notes, 1)))
+    xml = package.read('word/document.xml').decode('utf-8')
+    assert 'รายงานผลการสืบสวน กรณีคดียาบ้า 162,000 เม็ด' in xml
+    assert 'ขั้นที่ 2 (พิสูจน์ทราบตัวบุคคล)' in xml
+    assert 'เมื่อวันที่ 27 ตุลาคม 2569' in xml
+    assert '2 พฤศจิกายน 2569 20.13 น.' in xml
+    assert '( จ.ส.ต.อัจฉะริยะ จักรเรืองชัย )' in xml
+    assert 'บุคคลที่เกี่ยวข้อง : นายทดสอบ' in xml
+    assert 'ภาพที่ 1 : 2026-10-27_ขั้น2_เล่ชาญชัย_1.jpg' in xml
+    assert 'ตำแหน่ง ' in xml and 'ผบ.ร้อย ตชด.244' in xml
+    assert package.read('word/styles.xml')
+    assert 'word/media/image1.png' in package.namelist()
 
 
 def test_worker_updates_only_the_requested_case():

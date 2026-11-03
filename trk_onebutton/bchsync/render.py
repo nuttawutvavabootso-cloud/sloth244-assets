@@ -5,6 +5,8 @@ not one sheet per note). Timeline entries are the notes on that page.
 
 render_suep_files writes one Word document per timeline day, plus one PDF that
 joins every memo. Same-day notes share a file even when they are not adjacent.
+Each memo follows the unit pattern: TH Sarabun New, the same headings, margins
+and signature block. Missing values stay red placeholders.
 """
 import base64
 import html
@@ -63,6 +65,23 @@ def imgs(urls, cls='ph'):
     return '<div class="%s">%s</div>' % (cls, tags)
 
 
+MEMO_STAGE = {
+    '1': 'ได้ข่าว',
+    '2': 'พิสูจน์ทราบตัวบุคคล',
+    '3': 'เฝ้าติดตาม',
+    '4': 'รวบรวมหลักฐาน/ขอหมายจับ',
+    '5': 'จับกุมแล้ว',
+}
+FULL_MONTHS = ['มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน', 'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม']
+MEMO_UNIT = 'กองร้อยตำรวจตระเวนชายแดนที่ 244'
+MEMO_RED = 'C00000'
+FACT_LABEL = {
+    'บุคคล': 'บุคคลที่เกี่ยวข้อง',
+    'โทรศัพท์': 'หมายเลขโทรศัพท์ที่เกี่ยวข้อง',
+    'ทะเบียนรถ': 'ทะเบียนรถที่เกี่ยวข้อง',
+}
+
+
 def events(bundle):
     """Timeline notes, in the same order as the tracking page."""
     photos = bundle['photos']
@@ -71,15 +90,32 @@ def events(bundle):
         details = [(label, entry.get(key)) for key, label in (
             ('people', 'บุคคล'), ('phones', 'โทรศัพท์'), ('plates', 'ทะเบียนรถ')
         ) if c(entry.get(key))]
+        raw_photos = (photos.get('entries') or {}).get(entry['id'], []) or []
+        listed = entry.get('photoFiles') or entry.get('photoNames') or []
+        if not isinstance(listed, list):
+            listed = []
+        urls = []
+        names = []
+        for index, photo in enumerate(raw_photos):
+            if isinstance(photo, dict):
+                urls.append(photo.get('url') or photo.get('data') or '')
+                names.append(c(photo.get('name')))
+            else:
+                urls.append(photo)
+                names.append(c(listed[index]) if index < len(listed) else '')
         found.append({
             'date': entry.get('entryDate'),
             'time': entry.get('eventTime'),
             'title': c(entry.get('stageLabel')) or STAGE.get(c(entry.get('stage')), 'บันทึกความคืบหน้า'),
+            'stage': c(entry.get('stage')),
+            'stageLabel': c(entry.get('stageLabel')),
             'src': 'ระบบติดตามคดี',
             'text': entry.get('text'),
             'det': details,
-            'ph': photos['entries'].get(entry['id'], []),
+            'ph': urls,
+            'photoNames': names,
             'author': entry.get('authorName'),
+            'createdAt': entry.get('createdAt') or '',
         })
     return found
 
@@ -280,97 +316,282 @@ def _xml(text):
     return (str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
 
 
-def _paragraph(text, bold=False):
-    weight = '<w:b/>' if bold else ''
-    fonts = '<w:rFonts w:ascii="Sarabun" w:hAnsi="Sarabun" w:eastAsia="Sarabun" w:cs="Sarabun"/>'
+def _rpr(size=32, bold=False, color=None):
+    weight = '<w:b/><w:bCs/>' if bold else ''
+    paint = '<w:color w:val="%s"/>' % color if color else ''
     return (
-        '<w:p><w:r><w:rPr>%s%s<w:sz w:val="32"/></w:rPr>'
-        '<w:t xml:space="preserve">%s</w:t></w:r></w:p>'
-    ) % (weight, fonts, _xml(text))
+        '<w:rPr><w:rFonts w:ascii="TH Sarabun New" w:hAnsi="TH Sarabun New" '
+        'w:cs="TH Sarabun New" w:eastAsia="TH Sarabun New"/>%s%s'
+        '<w:sz w:val="%d"/><w:szCs w:val="%d"/><w:lang w:bidi="th-TH"/></w:rPr>'
+    ) % (weight, paint, size, size)
 
 
-def _image_paragraph(rel_id, name):
+def _run(text='', size=32, bold=False, color=None, tab=False):
+    mark = _rpr(size, bold, color)
+    if tab:
+        return '<w:r>%s<w:tab/></w:r>' % mark
+    return '<w:r>%s<w:t xml:space="preserve">%s</w:t></w:r>' % (mark, _xml(text))
+
+
+def _p(runs, before=0, after=0, left=0, right=0, first=None, hanging=None, align='left', border=False, tabs=None, keep_next=False):
+    indent = '<w:ind w:left="%d" w:right="%d"' % (left, right)
+    if first:
+        indent += ' w:firstLine="%d"' % first
+    if hanging:
+        indent += ' w:hanging="%d"' % hanging
+    indent += '/>'
+    edge = '<w:pBdr><w:bottom w:val="single" w:sz="8" w:space="1" w:color="000000"/></w:pBdr>' if border else ''
+    tab_xml = ''
+    if tabs:
+        tab_xml = '<w:tabs>' + ''.join('<w:tab w:val="%s" w:pos="%d"/>' % pair for pair in tabs) + '</w:tabs>'
+    keep = '<w:keepNext/>' if keep_next else ''
+    props = '<w:pPr>%s%s%s<w:spacing w:before="%d" w:after="%d"/>%s<w:jc w:val="%s"/>%s</w:pPr>' % (
+        keep, edge, tab_xml, before, after, indent, align, _rpr())
+    return '<w:p>%s%s</w:p>' % (props, ''.join(runs))
+
+
+def _full_date(value):
+    text = c(value)
+    try:
+        year, month, day = [int(part) for part in text[:10].split('-')]
+    except Exception:
+        return ''
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return ''
+    if year < 2400:
+        year += 543
+    return '%d %s %d' % (day, FULL_MONTHS[month - 1], year)
+
+
+def _clock(value):
+    match = re.search(r'T(\d{2}):(\d{2})', str(value or ''))
+    if match:
+        return '%s.%s น.' % (match.group(1), match.group(2))
+    match = re.match(r'^(\d{1,2}):(\d{2})', str(value or '').strip())
+    if not match:
+        return ''
+    return '%s.%s น.' % (match.group(1).zfill(2), match.group(2))
+
+
+def _red(text):
+    return _run(text, color=MEMO_RED)
+
+
+def _image_px(blob, ext):
+    if ext == 'png' and blob[:8] == b'\x89PNG\r\n\x1a\n' and len(blob) >= 24:
+        return int.from_bytes(blob[16:20], 'big'), int.from_bytes(blob[20:24], 'big')
+    if ext == 'jpeg':
+        index = 2
+        while index + 9 < len(blob):
+            if blob[index] != 0xFF:
+                index += 1
+                continue
+            marker = blob[index + 1]
+            length = int.from_bytes(blob[index + 2:index + 4], 'big')
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                height = int.from_bytes(blob[index + 5:index + 7], 'big')
+                width = int.from_bytes(blob[index + 7:index + 9], 'big')
+                return width, height
+            index += 2 + length
+    return 0, 0
+
+
+def _drawing(rel, ext, blob, pic_id):
+    width, height = _image_px(blob, ext)
+    if not width or not height:
+        return ''
+    emu = 9525
+    box_w = width * emu
+    box_h = height * emu
+    scale = min(1.0, (4.2 * 914400) / box_w, (3.2 * 914400) / box_h)
+    box_w = int(round(box_w * scale))
+    box_h = int(round(box_h * scale))
+    filename = 'image%d.%s' % (pic_id, ext)
     return (
-        '<w:p><w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0">'
-        '<wp:extent cx="3200400" cy="2400300"/><wp:docPr id="%d" name="%s"/>'
-        '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
-        '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">'
-        '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+        '<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0">'
+        '<wp:extent cx="%d" cy="%d"/><wp:docPr id="%d" name="Picture %d"/>'
+        '<wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>'
+        '<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic>'
         '<pic:nvPicPr><pic:cNvPr id="%d" name="%s"/><pic:cNvPicPr/></pic:nvPicPr>'
         '<pic:blipFill><a:blip r:embed="%s"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>'
-        '<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="3200400" cy="2400300"/></a:xfrm>'
+        '<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="%d" cy="%d"/></a:xfrm>'
         '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic>'
-        '</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>'
-    ) % (int(rel_id[3:]), _xml(name), int(rel_id[3:]), _xml(name), rel_id)
+        '</a:graphicData></a:graphic></wp:inline></w:drawing></w:r>'
+    ) % (box_w, box_h, pic_id, pic_id, pic_id, _xml(filename), rel, box_w, box_h)
+
+
+def _memo_images(item):
+    found = []
+    names = item.get('photoNames') or []
+    for index, url in enumerate(item.get('ph') or []):
+        parsed = _data_image(url)
+        if not parsed:
+            continue
+        ext, blob = parsed
+        label = c(names[index]) if index < len(names) else ''
+        found.append((label, ext, blob))
+    return found
+
+
+def _stage_runs(item):
+    stage = c(item.get('stage'))
+    label = c(item.get('stageLabel')) or MEMO_STAGE.get(stage, '')
+    when = _full_date(item.get('date'))
+    clock = _clock(item.get('time'))
+    time_known = (not c(item.get('time'))) or bool(clock)
+    if stage and label and when and time_known:
+        sentence = 'บัดนี้ ได้ดำเนินการสืบสวนในขั้นที่ %s (%s) เมื่อวันที่ %s' % (stage, label, when)
+        if clock:
+            sentence += ' เวลา ' + clock
+        return [_run(sentence + ' ผลการสืบสวนปรากฏดังนี้')]
+    runs = [_run('บัดนี้ ได้ดำเนินการสืบสวนในขั้นที่ ')]
+    if stage and label:
+        runs.append(_run('%s (%s) ' % (stage, label)))
+    elif stage:
+        runs.extend([_run(stage + ' ('), _red('........................'), _run(') ')])
+    else:
+        runs.extend([_red('......'), _run(' ')])
+    runs.append(_run('เมื่อวันที่ '))
+    runs.append(_run(when) if when else _red('........................'))
+    if c(item.get('time')):
+        runs.append(_run(' เวลา '))
+        runs.append(_run(clock) if clock else _red('............'))
+    runs.append(_run(' ผลการสืบสวนปรากฏดังนี้'))
+    return runs
 
 
 def build_suep_docx(bundle, notes=None, number=None):
-    """One .docx. Each timeline note is its own section."""
+    """One pattern memo for the notes of a single timeline date. `number` stays in the filename only."""
+    del number
     fields = (bundle.get('snap') or {}).get('fields', {})
-    case_name = c(fields.get('caseName')) or c(bundle.get('caseName'))
-    rank = c(fields.get('comRank'))
-    signer = ' '.join(part for part in [c(fields.get('comFName')), c(fields.get('comLName'))] if part)
+    case_name = c(fields.get('caseName')) or c(bundle.get('caseName')) or c(bundle.get('title'))
+    items = list(events(bundle) if notes is None else (notes or []))
+    stamps = [c(item.get('createdAt')) for item in items if c(item.get('createdAt'))]
+    header_iso = stamps[-1] if stamps else (c(items[0].get('date')) if items else '')
+    header_date = _full_date(header_iso)
+    authors = []
+    for item in items:
+        name = c(item.get('author'))
+        if name and name not in authors:
+            authors.append(name)
     media = []
-    body = []
-    notes = (events(bundle) if notes is None else notes) or [None]
-    for index, item in enumerate(notes, 1):
-        if number is not None:
-            index = number
-        if index > 1:
-            body.append('<w:p><w:r><w:br w:type="page"/></w:r></w:p>')
-        body.append(_paragraph('บันทึกข้อความ', True))
-        body.append(_paragraph('ส่วนราชการ  กองร้อยตำรวจตระเวนชายแดนที่ 244  อ.เมืองบึงกาฬ  จ.บึงกาฬ'))
-        if item is None:
-            body.append(_paragraph('ยังไม่มีเหตุการณ์ในคดีนี้'))
-            continue
-        body.append(_paragraph('วันที่ ' + thd(item['date'], True)))
-        body.append(_paragraph('เรื่อง  รายงานการสืบสวน %s (ครั้งที่ %s)' % (case_name or '—', th(index)), True))
-        body.append(_paragraph('เรียน  ผบ.ร้อย ตชด.244'))
-        when = thd(item['date'], True) + ((' เวลา ' + c(item.get('time')) + ' น.') if c(item.get('time')) else '')
-        body.append(_paragraph('เมื่อวันที่ %s (%s) %s' % (when, item['title'], c(item.get('text')) or '—')))
-        for label, value in item['det']:
-            body.append(_paragraph('- %s: %s' % (label, c(value) or '—')))
-        for url in item['ph']:
-            parsed = _data_image(url)
-            if not parsed:
-                continue
-            ext, blob = parsed
-            rel = 'rId%d' % (len(media) + 1)
-            media.append((rel, ext, blob))
-            body.append(_image_paragraph(rel, 'photo%d.%s' % (len(media), ext)))
-        body.append(_paragraph('จึงเรียนมาเพื่อโปรดทราบ'))
-        body.append(_paragraph(rank or ''))
-        body.append(_paragraph('( %s )' % (signer or '—')))
-        body.append(_paragraph('หัวหน้าชุด'))
-        body.append(_paragraph('แหล่งข้อมูล: %s' % item['src']))
+    body = [_p([_run('บันทึกข้อความ', size=58, bold=True)], align='center', after=120)]
+    body.append(_p([
+        _run('ส่วนราชการ', size=40, bold=True),
+        _run(' ชุดปฏิบัติการข่าว (ชปข.) ' + MEMO_UNIT),
+    ], border=True, after=60))
+    date_runs = [
+        _run('ที่', size=40, bold=True), _run(' '), _red('ตชด.244 (ชปข.)/.............'),
+        _run(tab=True), _run('วันที่', size=40, bold=True), _run(' '),
+        _run(header_date) if header_date else _red('........................'),
+    ]
+    body.append(_p(date_runs, border=True, after=60, tabs=[('left', 4536)]))
+    subject = [_run('เรื่อง', size=40, bold=True)]
+    subject.append(_run(' รายงานผลการสืบสวน กรณี' + case_name) if case_name else _run(' รายงานผลการสืบสวน กรณี'))
+    if not case_name:
+        subject.append(_red('........................'))
+    body.append(_p(subject, border=True, after=200))
+    body.append(_p([_run('เรียน', bold=True), _run(' '), _red('ผบ.ร้อย ตชด.244')], after=200))
+    if case_name:
+        intro = [_run('ตามที่ ชุดปฏิบัติการข่าว %s ได้ดำเนินการสืบสวนติดตามกรณี%s นั้น' % (MEMO_UNIT, case_name))]
+    else:
+        intro = [_run('ตามที่ ชุดปฏิบัติการข่าว %s ได้ดำเนินการสืบสวนติดตามกรณี' % MEMO_UNIT), _red('........................'), _run(' นั้น')]
+    body.append(_p(intro, first=1418, align='thaiDistribute'))
+    if not items:
+        body.append(_p([_red('..................................................')], first=1418, align='thaiDistribute', after=60))
+    for item in items:
+        body.append(_p(_stage_runs(item), first=1418, align='thaiDistribute', after=60))
+        lines = [line.strip() for line in str(item.get('text') or '').replace('\r\n', '\n').split('\n') if line.strip()]
+        if lines:
+            for line in lines:
+                body.append(_p([_run(line)], first=1418, align='thaiDistribute'))
+        else:
+            body.append(_p([_red('..................................................')], first=1418, align='thaiDistribute'))
+        facts = []
+        for label, value in item.get('det') or []:
+            shown = FACT_LABEL.get(label, c(label))
+            text = c(value)
+            if shown and text:
+                facts.append((shown, text))
+        if facts:
+            body.append(_p([_run('ข้อมูลที่ตรวจพบ')], first=1418, before=120))
+            for index, (label, value) in enumerate(facts, 1):
+                body.append(_p([_run('%d. %s : %s' % (index, label, value))], left=1702, hanging=284))
+        shots = _memo_images(item)
+        if shots:
+            body.append(_p([_run('ภาพถ่ายประกอบ จำนวน %d ภาพ (จัดเก็บต้นฉบับไว้ในโฟลเดอร์เคส)' % len(shots))], first=1418, before=120, keep_next=True))
+            for offset, (label, ext, blob) in enumerate(shots, 1):
+                pic_id = len(media) + 1
+                rel = 'rIdImg%d' % pic_id
+                drawing = _drawing(rel, ext, blob, pic_id)
+                if not drawing:
+                    continue
+                media.append((rel, ext, blob))
+                body.append(_p([drawing], align='center', before=80, keep_next=True))
+                if label:
+                    caption = [_run('ภาพที่ %d : %s' % (offset, label), size=26)]
+                else:
+                    caption = [_run('ภาพที่ %d : ' % offset, size=26), _run('ไม่ระบุชื่อไฟล์', size=26, color=MEMO_RED)]
+                body.append(_p(caption, align='center', after=60))
+    body.append(_p([_run('จึงเรียนมาเพื่อโปรดทราบ')], first=1418, before=200, after=480))
+    if len(authors) == 1:
+        signed = [_run('( %s )' % authors[0])]
+    else:
+        signed = [_run('( '), _red('.................................................. ยังไม่ระบุชื่อผู้บันทึก'), _run(' )')]
+    body.append(_p([_run('(ลงชื่อ) ..................................................')], left=3969, align='center', keep_next=True))
+    body.append(_p(signed, left=3969, align='center', keep_next=True))
+    body.append(_p([_run('ตำแหน่ง '), _red('..................................................')], left=3969, align='center', keep_next=True))
+    body.append(_p([_run('ผู้บันทึก')], left=3969, align='center'))
+    footer = 'ข้อความสีแดง = ยังไม่ได้ยืนยัน ให้ตรวจแก้ก่อนใช้งาน · สร้างจากระบบติดตามเคส เมื่อ '
+    if header_date:
+        clock = _clock(header_iso)
+        footer += header_date + ((' ' + clock) if clock else '')
+        body.append(_p([_run(footer, size=22, color='7F7F7F')], before=480))
+    else:
+        body.append(_p([_run(footer, size=22, color='7F7F7F'), _run('........................', size=22, color=MEMO_RED)], before=480))
     document = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
-        'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">'
-        '<w:body>%s<w:sectPr><w:pgSz w:w="11906" w:h="16838" w:orient="portrait"/>'
-        '<w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1418"/></w:sectPr></w:body></w:document>'
+        'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        'xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+        '<w:body>%s<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
+        '<w:pgMar w:top="1418" w:right="1134" w:bottom="1134" w:left="1701" w:header="709" w:footer="709" w:gutter="0"/>'
+        '</w:sectPr></w:body></w:document>'
     ) % ''.join(body)
-    rels = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">']
+    styles = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults>'
+        '<w:rPrDefault><w:rPr><w:rFonts w:ascii="TH Sarabun New" w:hAnsi="TH Sarabun New" w:cs="TH Sarabun New" w:eastAsia="TH Sarabun New"/>'
+        '<w:sz w:val="32"/><w:szCs w:val="32"/><w:lang w:val="th-TH" w:bidi="th-TH"/></w:rPr></w:rPrDefault>'
+        '<w:pPrDefault><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>'
+        '<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style></w:styles>'
+    )
+    rels = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+        '<Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>',
+    ]
     for rel, ext, _blob in media:
         rels.append(
-            '<Relationship Id="%s" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/%s.%s"/>'
-            % (rel, rel, ext)
+            '<Relationship Id="%s" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image%s.%s"/>'
+            % (rel, rel.replace('rIdImg', ''), ext)
         )
     rels.append('</Relationships>')
     content_types = (
-        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
         '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
         '<Default Extension="xml" ContentType="application/xml"/>'
         '<Default Extension="png" ContentType="image/png"/>'
         '<Default Extension="jpeg" ContentType="image/jpeg"/>'
         '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
         '</Types>'
     )
     package_rels = (
-        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
         '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
         '</Relationships>'
@@ -380,9 +601,10 @@ def build_suep_docx(bundle, notes=None, number=None):
         archive.writestr('[Content_Types].xml', content_types)
         archive.writestr('_rels/.rels', package_rels)
         archive.writestr('word/document.xml', document)
+        archive.writestr('word/styles.xml', styles)
         archive.writestr('word/_rels/document.xml.rels', ''.join(rels))
         for rel, ext, blob in media:
-            archive.writestr('word/media/%s.%s' % (rel, ext), blob)
+            archive.writestr('word/media/image%s.%s' % (rel.replace('rIdImg', ''), ext), blob)
     return buffer.getvalue()
 
 
