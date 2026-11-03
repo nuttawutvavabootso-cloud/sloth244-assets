@@ -173,6 +173,22 @@ def test_memos_group_by_day_even_when_split():
     assert 'group_by_day' in source
 
 
+def test_day_memo_has_no_leading_page_break():
+    bundle = {
+        'caseName': 'ทดสอบ',
+        'photos': {'entries': {}, 'targets': {}, 'bch': {}},
+        'local': {'entries': [
+            {'id': 'a', 'entryDate': '2026-01-02', 'text': 'วันแรก', 'stage': '1', 'stageLabel': 'ได้ข่าว', 'createdAt': '2026-01-02T10:00:00+07:00', 'authorName': 'ก'},
+            {'id': 'b', 'entryDate': '2026-01-03', 'text': 'วันที่สอง', 'stage': '2', 'stageLabel': 'พิสูจน์ทราบตัวบุคคล', 'createdAt': '2026-01-03T10:00:00+07:00', 'authorName': 'ก'},
+        ]},
+        'snap': {'fields': {'caseName': 'ทดสอบ'}},
+    }
+    groups = render.group_by_day(bundle)
+    second = zipfile.ZipFile(io.BytesIO(render.build_suep_docx(bundle, groups[1][1], 2))).read('word/document.xml').decode('utf-8')
+    assert 'w:type="page"' not in second
+    assert 'วันที่สอง' in second and 'วันแรก' not in second
+
+
 def test_memo_uses_known_fields_and_red_gaps():
     tiny = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
     bundle = {

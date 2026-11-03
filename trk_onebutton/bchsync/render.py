@@ -482,9 +482,11 @@ def build_suep_docx(bundle, notes=None, number=None):
     ], border=True, after=60))
     date_runs = [
         _run('ที่', size=40, bold=True), _run(' '), _red('ตชด.244 (ชปข.)/.............'),
-        _run(tab=True), _run('วันที่', size=40, bold=True), _run(' '),
-        _run(header_date) if header_date else _red('........................'),
+        _run(tab=True), _run('วันที่', size=40, bold=True),
+        _run(' ' + header_date) if header_date else _run(' '),
     ]
+    if not header_date:
+        date_runs.append(_red('........................'))
     body.append(_p(date_runs, border=True, after=60, tabs=[('left', 4536)]))
     subject = [_run('เรื่อง', size=40, bold=True)]
     subject.append(_run(' รายงานผลการสืบสวน กรณี' + case_name) if case_name else _run(' รายงานผลการสืบสวน กรณี'))

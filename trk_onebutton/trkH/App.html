@@ -1460,7 +1460,7 @@
       (function tick() {
         call('bchUpdateStatus', [session.token, reqId]).then(function (s) {
           if (s.done) return s.ok ? ok(s) : no(new Error(s.err || 'อัปเดตไม่สำเร็จ'));
-          if (Date.now() > until) return no(new Error('เครื่องดึงข้อมูลไม่ตอบ (เกิน 3 นาที)'));
+          if (Date.now() > until) return no(new Error('เครื่องดึงข้อมูลไม่ตอบ (เกิน 5 นาที)'));
           setTimeout(tick, 1500);
         }).catch(no);
       })();
@@ -1481,7 +1481,7 @@
     }, 1000);
     call('bchRequestUpdate', [session.token, id]).then(function (job) {
       if (!job || !job.reqId) throw new Error('ส่งคำขอไม่สำเร็จ');
-      return bchWaitUpdate(job.reqId, Date.now() + 180000);
+      return bchWaitUpdate(job.reqId, Date.now() + 300000);
     }).then(function () {
       return call('getCaseOutputFiles', [session.token, id]);
     }).then(function (r) {
